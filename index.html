@@ -9,7 +9,7 @@
 .hover-value{position:relative;display:inline-block;cursor:help}.value-pop{display:none;position:absolute;z-index:20;top:calc(100% + 5px);left:0;min-width:225px;padding:8px 10px;background:#0b1118;border:1px solid #61758a;border-radius:5px;box-shadow:0 5px 16px #000a;color:var(--text);font-size:11px;font-weight:400;line-height:1.6;white-space:nowrap}.value-pop b{color:var(--muted);font-weight:600}.hover-value:hover .value-pop,.hover-value:focus .value-pop,.hover-value:focus-within .value-pop{display:block}.pill .hover-value{font-weight:600}.pill .value-pop{font-weight:400}.changed .hover-value{outline:1px solid var(--change);border-radius:3px}</style>
 </head>
 <body>
-<header><h1>TDC32.01 — architectural emulator</h1><small>Minimal, dependency-free CPU POC · 32-bit words · one cycle per instruction</small></header>
+<header><h1>TDC32.01 — architectural emulator</h1><small>Minimal CPU POC · 16 registers · 32-bit words · POC counts one cycle per instruction</small></header>
 <main>
 <section class="panel">
 <h2>Program</h2>
@@ -19,21 +19,21 @@
     add r1, r2
     bpr r1, 12
     beq done
-    ldr r1, -1
+    li r1, -1
 :done
     swi -1</textarea>
 <div class="buttons"><button id="reset" class="primary">Reset / Load</button><button id="step">Step</button><button id="run">Run</button><button id="stop">Stop</button></div>
 <div id="message" class="message">Ready. Reset / Load to assemble the source.</div>
-<div class="hint">Syntax: one instruction per line; labels use <code>:name</code>. Supports LDR/LD, STR/ST, integer ALU, BPR, B[condition], B, SWI and SP push/pop forms. Comments start with ; or //.</div>
+<div class="hint">Syntax: one instruction per line; labels use <code>:name</code>. Supports integer and floating-point instructions, LI/.word conveniences, BPR, B[condition], JSR/RTS/RTI, SWI, and SP stack forms. The POC has no ROM image; vector/service entry stops after saving the exception frame. For FADD/FSUB, it clears C because the spec leaves floating carry undefined. Comments start with ; or //.</div>
 </section>
 <section class="panel">
 <h2>CPU state</h2>
-<div class="statusrow"><div class="pill">Cycles <b id="cycles">0</b></div><div class="pill">PC <b id="pc">00000000</b></div><div class="pill">SP <b id="sp">00000000</b></div><div class="pill">SR <b id="sr">00000000</b></div><div class="pill">State <b id="runstate">Ready</b></div></div>
-<div class="flags" id="flags"></div><h2>Registers (R0–R28)</h2><div class="regs" id="registers"></div>
+<div class="statusrow"><div class="pill">Cycles <b id="cycles">0</b></div><div class="pill">PC <b id="pc">00000000</b></div><div class="pill">SP <b id="sp">00000000</b></div><div class="pill">CUSR <b id="cusr">00000000</b></div><div class="pill">State <b id="runstate">Ready</b></div></div>
+<div class="flags" id="flags"></div><h2>Registers (R0–R15)</h2><div class="regs" id="registers"></div>
 <h2 style="margin-top:14px">Current instruction</h2><div id="current" class="current">—</div>
 </section>
 <section class="panel">
-<h2>Memory (data RAM, big-endian)</h2><div class="meta">Showing 16 words from address <input id="memaddr" value="0" size="10" aria-label="Memory address" style="background:#101820;color:inherit;border:1px solid #304052;padding:3px"> <button id="memrefresh">Go</button></div><div id="memory" class="memory"></div>
+<h2>Memory (32 KiB installed data RAM, big-endian)</h2><div class="meta">Showing 16 words from address <input id="memaddr" value="0" size="10" aria-label="Memory address" style="background:#101820;color:inherit;border:1px solid #304052;padding:3px"> <button id="memrefresh">Go</button></div><div id="memory" class="memory"></div>
 </section>
 <section class="panel"><h2>Execution trace</h2><div id="trace" class="trace"></div></section>
 </main>
