@@ -189,21 +189,31 @@ const TDC32 = (() => {
         const unary = op === 'inc' || op === 'dec';
         if (args.length !== (unary ? 1 : 2)) fail(`Line ${lineNo}: invalid ${op.toUpperCase()} operands`);
         const rd = register(args[0]);
-        if (rd === null || rd > 13) fail(`Line ${lineNo}: ${op.toUpperCase()} destination must be R0–R13`);
-        let expanded, modifier = false;
-        if (op === 'inc') expanded = `add ${args[0]}, ${args[0]}, 1`;
-        else if (op === 'dec') expanded = `sub ${args[0]}, ${args[0]}, 1`;
-        else {
+        if (rd === null || rd > (op === 'not' ? 11 : 13)) fail(`Line ${lineNo}: invalid ${op.toUpperCase()} destination`);
+        if (op === 'not') {
           const rs = register(args[1]);
-          if (rs === null) fail(`Line ${lineNo}: ${op.toUpperCase()} source must be a register`);
-          if (op === 'neg') expanded = `sub ${args[0]}, r0, ${args[1]}`;
-          else { expanded = `xor ${args[0]}, ${args[1]}, -1`; modifier = true; }
+          if (rs === null || rs > 11) fail(`Line ${lineNo}: NOT source must be R0–R11; R12 is its scratch register`);
+          const emitted = [`ld r12, 65535`, `ld.l r12, 65535`, `xor ${args[0]}, ${args[1]}, r12`];
+          for (const expanded of emitted) {
+            if (pc & 3 || pc + 4 > RAM_BYTES) fail(`Line ${lineNo}: code must be assembled at an aligned address in installed RAM`);
+            reserve(pc, 4, lineNo); raw.push({ line: expanded, displayLine: expanded, lineNo, pc });
+            if (entryPC === null) entryPC = pc;
+            pc += 4;
+          }
+        } else {
+          let expanded;
+          if (op === 'inc') expanded = `add ${args[0]}, ${args[0]}, 1`;
+          else if (op === 'dec') expanded = `sub ${args[0]}, ${args[0]}, 1`;
+          else {
+            const rs = register(args[1]);
+            if (rs === null) fail(`Line ${lineNo}: NEG source must be a register`);
+            expanded = `sub ${args[0]}, r0, ${args[1]}`;
+          }
+          if (pc & 3 || pc + 4 > RAM_BYTES) fail(`Line ${lineNo}: code must be assembled at an aligned address in installed RAM`);
+          reserve(pc, 4, lineNo); raw.push({ line: expanded, displayLine: expanded, lineNo, pc });
+          if (entryPC === null) entryPC = pc;
+          pc += 4;
         }
-        if (pc & 3 || pc + 4 > RAM_BYTES) fail(`Line ${lineNo}: code must be assembled at an aligned address in installed RAM`);
-        const displayLine = op === 'not' ? `xor ${args[0]}, ${args[1]}, $FFFFFFFF` : expanded;
-        reserve(pc, 4, lineNo); raw.push({ line: expanded, displayLine, modifier, lineNo, pc });
-        if (entryPC === null) entryPC = pc;
-        pc += 4;
       } else if (op === 'lea') {
         if (args.length !== 2) fail(`Line ${lineNo}: LEA syntax is LEA Rd, label`);
         const rd = register(args[0]);
@@ -419,7 +429,7 @@ const TDC32 = (() => {
     ins.kind = 'alu-rimm'; checkedAluImmediate(ins); return ins;
   }
   function checkedAluImmediate(ins) {
-    const zeroExtended = (['and','or','xor','rol','ror','shl','shr','asr'].includes(ins.op) && !(ins.op === 'xor' && ins.modifier)) || (ins.op === 'div' && ins.modifier);
+    const zeroExtended = ['and','or','xor','rol','ror','shl','shr','asr'].includes(ins.op) || (ins.op === 'div' && ins.modifier);
     checked16(ins.imm, ins.lineNo, zeroExtended ? 'unsigned' : 'signed');
   }
   function parseFloatInstruction(ins, args) {
@@ -861,7 +871,7 @@ $('step').onclick = () => {
 $('run').onclick = () => {
   if (!cpu.program.length || loadedSource !== $('source').value) $('reset').click();
   if (loadedSource !== $('source').value || cpu.halted) return;
-  stop(); timer = setInterval(execute, 150); render();
+  stop(); timer = setInterval(execute, Number($('runDelay').value) || 5); render();
 };
 $('stop').onclick = stop;
 $('memrefresh').onclick = renderMemory;
