@@ -24,7 +24,7 @@
     swi -1</textarea>
 <div class="buttons"><button id="reset" class="primary">Reset / Assemble</button><button id="loadFile">Load File</button><button id="saveFile">Save File</button><input id="programFile" type="file" accept=".asm,.tdc,.txt,text/plain" hidden><button id="step">Step</button><button id="run">Run</button><button id="stop">Stop</button></div>
 <div id="message" class="message">Ready. Reset / Load to assemble the source.</div>
-<div class="hint">Syntax: one instruction per line; labels use <code>:name</code>. Supports integer and floating-point instructions, LI/LEA, `.adr`, `.code`, `.data`, `.str`/`.u8`/`.u16`/`.u32`, BPR, B[condition], JSR/RTS/RTI, SWI, and SP stack forms. The POC video buffer is at 0x00010000 and is an emulator-only memory-mapped region. The POC has no ROM image; vector/service entry stops after saving the exception frame. Comments start with ;.</div>
+<div class="hint">Syntax: one instruction per line; labels use <code>:name</code>. Supports integer and floating-point instructions, LI/LEA/ABS/MIN/MAX/NEG/NOT/INC/DEC/BTST/BSET/BCLR/BCHG aliases, `.adr`, `.code`, `.data`, `.str`/`.u8`/`.u16`/`.u32`, BPR, B[condition], JSR/RTS/RTI, SWI, and SP stack forms. The POC video buffer is at 0x00010000 and is an emulator-only memory-mapped region. The POC has no ROM image; vector/service entry stops after saving the exception frame. Comments start with ;.</div>
 </section>
 <section class="panel">
 <div class="cpu-layout"><div class="cpu-state">

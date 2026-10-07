@@ -144,7 +144,67 @@ const TDC32 = (() => {
         }
         continue;
       }
-      if (op === 'lea') {
+      if (op === 'min' || op === 'max') {
+        if (args.length !== 2) fail(`Line ${lineNo}: ${op.toUpperCase()} syntax is ${op.toUpperCase()} Rd, Rs`);
+        const rd = register(args[0]), rs = register(args[1]);
+        if (rd === null || rd > 12 || rs === null || rs > 12) fail(`Line ${lineNo}: ${op.toUpperCase()} operands must be R0–R12`);
+        const keep = op === 'min' ? 'ble 2' : 'bge 2';
+        const emitted = [`bpr ${args[0]}, ${args[1]}`, keep, `ld ${args[0]}, ${args[1]}`];
+        for (const expanded of emitted) {
+          if (pc & 3 || pc + 4 > RAM_BYTES) fail(`Line ${lineNo}: code must be assembled at an aligned address in installed RAM`);
+          reserve(pc, 4, lineNo); raw.push({ line: expanded, displayLine: expanded, lineNo, pc });
+          if (entryPC === null) entryPC = pc;
+          pc += 4;
+        }
+      } else if (op === 'abs') {
+        if (args.length !== 2) fail(`Line ${lineNo}: ABS syntax is ABS Rd, Rs`);
+        const rd = register(args[0]), rs = register(args[1]);
+        if (rd === null || rd > 12 || rs === null || rs > 12) fail(`Line ${lineNo}: ABS operands must be R0–R12`);
+        const target = rd === 0 ? 'r12' : args[0];
+        const emitted = [`bpr ${args[1]}, 0`, 'bmi 4', `ld ${target}, ${args[1]}`, `bpr ${target}, 0`, 'ba 2', `sub ${target}, r0, ${args[1]}`];
+        for (const expanded of emitted) {
+          if (pc & 3 || pc + 4 > RAM_BYTES) fail(`Line ${lineNo}: code must be assembled at an aligned address in installed RAM`);
+          reserve(pc, 4, lineNo); raw.push({ line: expanded, displayLine: expanded, lineNo, pc });
+          if (entryPC === null) entryPC = pc;
+          pc += 4;
+        }
+      } else if (['btst','bset','bclr','bchg'].includes(op)) {
+        if (args.length !== 2) fail(`Line ${lineNo}: ${op.toUpperCase()} syntax is ${op.toUpperCase()} Rd, bit`);
+        const rd = register(args[0]), bit = parseNum(args[1]);
+        if (rd === null || rd > 11) fail(`Line ${lineNo}: bit-operation target must be R0–R11; R12 is the alias scratch register`);
+        if (!Number.isInteger(bit) || bit < 0 || bit > 31) fail(`Line ${lineNo}: bit index must be an integer from 0 to 31`);
+        const mask = (2 ** bit) >>> 0, value = op === 'bclr' ? u32(~mask) : mask;
+        const load = value <= 0xffff ? [`ld r12, ${value}`] : [`ld r12, ${value >>> 16}`, `ld.l r12, ${value & 0xffff}`];
+        const logical = op === 'btst' ? `and r0, ${args[0]}, r12`
+          : op === 'bset' ? `or ${args[0]}, ${args[0]}, r12`
+          : op === 'bclr' ? `and ${args[0]}, ${args[0]}, r12`
+          : `xor ${args[0]}, ${args[0]}, r12`;
+        for (const expanded of [...load, logical]) {
+          if (pc & 3 || pc + 4 > RAM_BYTES) fail(`Line ${lineNo}: code must be assembled at an aligned address in installed RAM`);
+          reserve(pc, 4, lineNo); raw.push({ line: expanded, displayLine: expanded, lineNo, pc });
+          if (entryPC === null) entryPC = pc;
+          pc += 4;
+        }
+      } else if (['neg','not','inc','dec'].includes(op)) {
+        const unary = op === 'inc' || op === 'dec';
+        if (args.length !== (unary ? 1 : 2)) fail(`Line ${lineNo}: invalid ${op.toUpperCase()} operands`);
+        const rd = register(args[0]);
+        if (rd === null || rd > 13) fail(`Line ${lineNo}: ${op.toUpperCase()} destination must be R0–R13`);
+        let expanded, modifier = false;
+        if (op === 'inc') expanded = `add ${args[0]}, ${args[0]}, 1`;
+        else if (op === 'dec') expanded = `sub ${args[0]}, ${args[0]}, 1`;
+        else {
+          const rs = register(args[1]);
+          if (rs === null) fail(`Line ${lineNo}: ${op.toUpperCase()} source must be a register`);
+          if (op === 'neg') expanded = `sub ${args[0]}, r0, ${args[1]}`;
+          else { expanded = `xor ${args[0]}, ${args[1]}, -1`; modifier = true; }
+        }
+        if (pc & 3 || pc + 4 > RAM_BYTES) fail(`Line ${lineNo}: code must be assembled at an aligned address in installed RAM`);
+        const displayLine = op === 'not' ? `xor ${args[0]}, ${args[1]}, $FFFFFFFF` : expanded;
+        reserve(pc, 4, lineNo); raw.push({ line: expanded, displayLine, modifier, lineNo, pc });
+        if (entryPC === null) entryPC = pc;
+        pc += 4;
+      } else if (op === 'lea') {
         if (args.length !== 2) fail(`Line ${lineNo}: LEA syntax is LEA Rd, label`);
         const rd = register(args[0]);
         if (rd === null || rd > 13) fail(`Line ${lineNo}: LEA destination must be R0–R13`);
@@ -219,7 +279,7 @@ const TDC32 = (() => {
     const { line, displayLine, lineNo, pc } = item;
     const [mn, ...tail] = line.split(/\s+/), originalOp = mn.toLowerCase();
     let op = originalOp, args = splitArgs(tail.join(' '));
-    const ins = { op, args, line: displayLine, lineNo, pc, modifier: false };
+    const ins = { op, args, line: displayLine, lineNo, pc, modifier: !!item.modifier };
     if (!args.length && op !== 'rts' && op !== 'rti') fail(`Line ${lineNo}: missing operands`);
 
     if (op === 'rts' || (op === 'ba' && args[0]?.toLowerCase() === '(sp)+' && args.length === 1)) {
@@ -359,7 +419,7 @@ const TDC32 = (() => {
     ins.kind = 'alu-rimm'; checkedAluImmediate(ins); return ins;
   }
   function checkedAluImmediate(ins) {
-    const zeroExtended = ['and','or','xor','rol','ror','shl','shr','asr'].includes(ins.op) || (ins.op === 'div' && ins.modifier);
+    const zeroExtended = (['and','or','xor','rol','ror','shl','shr','asr'].includes(ins.op) && !(ins.op === 'xor' && ins.modifier)) || (ins.op === 'div' && ins.modifier);
     checked16(ins.imm, ins.lineNo, zeroExtended ? 'unsigned' : 'signed');
   }
   function parseFloatInstruction(ins, args) {
