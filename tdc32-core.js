@@ -50,7 +50,7 @@ const TDC32 = (() => {
   }
 
   function splitArgs(s) { return s.split(',').map(x => x.trim()).filter(Boolean); }
-  function cleanLine(s) { return s.replace(/;.*/, '').replace(/\/\/.*/, '').trim(); }
+  function cleanLine(s) { return s.replace(/;.*/, '').trim(); }
   function literal32(s, lineNo) {
     const n = parseNum(s);
     if (n === null || !Number.isInteger(n) || n < -0x80000000 || n > 0xffffffff)
@@ -173,7 +173,7 @@ const TDC32 = (() => {
       ins.imm = checked16(resolveImmediate(args[1], labels, pc, lineNo, false), lineNo, 'unsigned');
       ins.modifier = true; return ins;
     }
-    const aliases = { ldr: 'ld', str: 'st', mulhu: 'mulh', divu: 'div', divqu: 'divq' };
+    const aliases = { mulhu: 'mulh', divu: 'div', divqu: 'divq' };
     op = aliases[op] || op; ins.op = op;
     if (originalOp === 'mulhu') ins.modifier = true;
     if (originalOp === 'divu' || originalOp === 'divqu') ins.modifier = true;
@@ -366,8 +366,6 @@ const TDC32 = (() => {
     if ((bits & 0x7fffffff) === 0) sr |= FLAG.Z;
     if (bits & 0x80000000) sr |= FLAG.N;
     if (overflow) sr |= FLAG.V;
-    // FADD/FSUB require C to be written, but the spec does not define its meaning.
-    // The POC deterministically clears C for those operations only.
     if (writeCarry) sr &= ~FLAG.C;
     state.regs[13] = (state.regs[13] & ~0xff) | (sr & SR_MASK);
   }
@@ -571,7 +569,7 @@ const TDC32 = (() => {
 
 // Browser UI, intentionally separate from the CPU core above.
 const $ = id => document.getElementById(id), cpu = TDC32.state;
-let timer = null;
+let timer = null, bitmapBaseCache = null, loadedSource = null;
 function valueDisplay(value) {
   const n = Number(value) >>> 0;
   return `<span class="hover-value" tabindex="0"><span class="value-main">${TDC32.fmt(n)}</span><span class="value-pop"><b>Hex:</b> ${TDC32.fmt(n)}<br><b>Dec:</b> ${n}<br><b>Bin:</b> ${n.toString(2).padStart(32, '0')}</span></span>`;
@@ -591,12 +589,39 @@ function render() {
   $('cusr').className = cpu.changedRegs.has(13) ? 'changed' : '';
   $('runstate').textContent = cpu.trap ? 'ROM / TRAP STOP' : cpu.halted ? 'Halted' : timer ? 'Running' : 'Ready';
   flagUI();
-  $('registers').innerHTML = Array.from({ length: 16 }, (_, i) =>
-    `<div class="reg ${cpu.changedRegs.has(i) ? 'changed' : ''}"><span>R${i}</span>${valueDisplay(i === 15 ? cpu.pc : cpu.regs[i])}</div>`
+  $('registers').innerHTML = Array.from({ length: 13 }, (_, i) =>
+    `<div class="reg ${cpu.changedRegs.has(i) ? 'changed' : ''}"><span>R${i}</span>${valueDisplay(cpu.regs[i])}</div>`
   ).join('');
   const ins = cpu.sourceMap.get(cpu.pc);
   $('current').textContent = cpu.trap ? cpu.trap : ins ? `${TDC32.fmt(ins.pc)}  ${ins.line}` : cpu.halted ? 'CPU halted' : 'No instruction at PC';
   renderMemory();
+  renderBitmap();
+}
+function renderBitmap(force = false) {
+  const width = 640, height = 480, frameBytes = width * height / 8;
+  let base = TDC32.parseNum($('bitmapBase').value.trim());
+  if (base === null || base < 0 || base >= TDC32.constants.RAM_BYTES) base = 0;
+  base = Math.floor(base) >>> 0;
+  $('bitmapBase').value = TDC32.fmt(base);
+  if (!force && bitmapBaseCache === base && cpu.changedMem.size === 0) return;
+  bitmapBaseCache = base;
+  const canvas = $('bitmap'), ctx = canvas.getContext && canvas.getContext('2d');
+  if (!ctx) return;
+  const image = ctx.createImageData(width, height), pixels = image.data;
+  let byte = 0;
+  for (let p = 0; p < width * height; p++) {
+    const bit = p & 7;
+    if (bit === 0) {
+      const address = base + (p >>> 3);
+      byte = address < TDC32.constants.RAM_BYTES ? cpu.ram.getUint8(address) : 0;
+    }
+    const on = (byte & (1 << (7 - bit))) !== 0, i = p * 4;
+    pixels[i] = pixels[i + 1] = pixels[i + 2] = on ? 255 : 0;
+    pixels[i + 3] = 255;
+  }
+  ctx.putImageData(image, 0, 0);
+  const available = Math.max(0, Math.min(frameBytes, TDC32.constants.RAM_BYTES - base));
+  $('bitmapInfo').textContent = `Packed monochrome, 1 bit/pixel, MSB first · ${available}/${frameBytes} bytes in installed RAM; unavailable pixels are black.`;
 }
 function renderMemory() {
   let base = TDC32.parseNum($('memaddr').value.trim());
@@ -631,15 +656,25 @@ $('reset').onclick = () => {
   stop();
   try {
     const code = TDC32.assemble($('source').value);
-    TDC32.reset(code); $('trace').innerHTML = '';
+    TDC32.reset(code); loadedSource = $('source').value; bitmapBaseCache = null; $('trace').innerHTML = '';
     $('message').className = 'message';
     $('message').textContent = `Loaded ${code.length} instruction${code.length === 1 ? '' : 's'}; POC starts at RAM address 0.`;
     render();
   } catch (e) { $('message').className = 'message error'; $('message').textContent = e.message; }
 };
-$('step').onclick = () => { if (!cpu.program.length) $('reset').click(); if (!cpu.halted) execute(); };
-$('run').onclick = () => { if (!cpu.program.length) $('reset').click(); if (cpu.halted) return; stop(); timer = setInterval(execute, 150); render(); };
+$('step').onclick = () => {
+  if (!cpu.program.length || loadedSource !== $('source').value) $('reset').click();
+  if (loadedSource !== $('source').value) return;
+  if (!cpu.halted) execute();
+};
+$('run').onclick = () => {
+  if (!cpu.program.length || loadedSource !== $('source').value) $('reset').click();
+  if (loadedSource !== $('source').value || cpu.halted) return;
+  stop(); timer = setInterval(execute, 150); render();
+};
 $('stop').onclick = stop;
 $('memrefresh').onclick = renderMemory;
 $('memaddr').addEventListener('keydown', e => { if (e.key === 'Enter') renderMemory(); });
+$('bitmapRefresh').onclick = () => renderBitmap(true);
+$('bitmapBase').addEventListener('keydown', e => { if (e.key === 'Enter') renderBitmap(true); });
 render();
