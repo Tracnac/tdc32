@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TDC32.01 CPU emulator</title>
+<style>
+:root{color-scheme:dark;--bg:#10151c;--panel:#19222d;--line:#304052;--text:#e5edf5;--muted:#9aabbc;--accent:#61d5ae;--change:#ffcf70;--bad:#ff7885}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}header{padding:16px 22px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between}h1{font:600 19px system-ui;margin:0}header small{color:var(--muted)}main{padding:16px;display:grid;grid-template-columns:minmax(320px,1fr) minmax(390px,1.15fr);gap:14px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px;min-width:0}.panel h2{font:600 14px system-ui;margin:0 0 10px;color:#cbd9e7}.source{height:310px;width:100%;resize:vertical;background:#0d1218;color:#dbe7f3;border:1px solid var(--line);border-radius:5px;padding:10px;font:13px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;tab-size:4;white-space:pre}.buttons{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}button{border:1px solid #456075;background:#263747;color:var(--text);padding:7px 13px;border-radius:5px;font:600 13px system-ui;cursor:pointer}button:hover{border-color:var(--accent)}button.primary{background:#165541;border-color:#287c5e}button:disabled{opacity:.45;cursor:default}.hint,.meta{color:var(--muted);font-size:12px;margin-top:9px}.message{min-height:20px;color:var(--accent);margin-top:8px}.message.error{color:var(--bad)}.statusrow{display:flex;gap:16px;flex-wrap:wrap;margin:0 0 12px}.pill{background:#101820;border:1px solid var(--line);border-radius:5px;padding:5px 9px}.pill b{color:var(--accent);font-weight:600}.flags{display:flex;gap:6px;margin:8px 0 14px}.flag{padding:3px 7px;border-radius:4px;background:#26313d;color:#768697}.flag.on{background:#594725;color:#ffe098}.regs{display:grid;grid-template-columns:repeat(4,minmax(90px,1fr));gap:5px}.reg{padding:5px 7px;background:#111820;border:1px solid transparent;border-radius:4px;display:flex;justify-content:space-between;gap:5px}.reg span:first-child{color:var(--muted)}.changed{border-color:var(--change)!important;color:var(--change)!important;transition:border-color 1s}.current{padding:9px;background:#101820;border-radius:5px;border-left:3px solid var(--accent);min-height:39px}.bottom{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px}.memory{height:210px;overflow:auto;background:#101820;padding:8px;border-radius:5px;font-size:12px}.memrow{display:grid;grid-template-columns:90px repeat(4,1fr);gap:6px;padding:2px 4px}.memrow.head{color:var(--muted);border-bottom:1px solid var(--line);position:sticky;top:0;background:#101820}.memrow.changed{background:#433c29}.trace{height:210px;overflow:auto;background:#101820;padding:8px;border-radius:5px;font-size:12px}.trace div{padding:2px 4px;border-bottom:1px solid #202b36}.trace .pc{color:var(--accent)}@media(max-width:850px){main{grid-template-columns:1fr}.regs{grid-template-columns:repeat(2,1fr)}}@media(max-width:520px){.bottom{grid-template-columns:1fr}header{align-items:flex-start;gap:8px;flex-direction:column}}
+</style>
+</head>
+<body>
+<header><h1>TDC32.01 — architectural emulator</h1><small>Minimal, dependency-free CPU POC · 32-bit words · one cycle per instruction</small></header>
+<main>
+<section class="panel">
+<h2>Program</h2>
+<textarea id="source" class="source" spellcheck="false">:start
+    ldr r1, 0x5
+    ldr r2, 0b1100
+    add r1, r2
+    bpr r1, 12
+    beq done
+    ldr r1, -1
+:done
+    swi -1</textarea>
+<div class="buttons"><button id="reset" class="primary">Reset / Load</button><button id="step">Step</button><button id="run">Run</button><button id="stop">Stop</button></div>
+<div id="message" class="message">Ready. Reset / Load to assemble the source.</div>
+<div class="hint">Syntax: one instruction per line; labels use <code>:name</code>. Supports LDR/LD, STR/ST, integer ALU, BPR, B[condition], B, SWI and SP push/pop forms. Comments start with ; or //.</div>
+</section>
+<section class="panel">
+<h2>CPU state</h2>
+<div class="statusrow"><div class="pill">Cycles <b id="cycles">0</b></div><div class="pill">PC <b id="pc">00000000</b></div><div class="pill">SP <b id="sp">00000000</b></div><div class="pill">SR <b id="sr">00000000</b></div><div class="pill">State <b id="runstate">Ready</b></div></div>
+<div class="flags" id="flags"></div><h2>Registers (R0–R28)</h2><div class="regs" id="registers"></div>
+<h2 style="margin-top:14px">Current instruction</h2><div id="current" class="current">—</div>
+</section>
+<section class="panel">
+<h2>Memory (data RAM, big-endian)</h2><div class="meta">Showing 16 words from address <input id="memaddr" value="0" size="10" aria-label="Memory address" style="background:#101820;color:inherit;border:1px solid #304052;padding:3px"> <button id="memrefresh">Go</button></div><div id="memory" class="memory"></div>
+</section>
+<section class="panel"><h2>Execution trace</h2><div id="trace" class="trace"></div></section>
+</main>
+<script src="tdc32-core.js"></script>
+
+</body>
+</html>
