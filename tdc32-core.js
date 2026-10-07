@@ -753,7 +753,8 @@ const TDC32 = (() => {
 
 // Browser UI, intentionally separate from the CPU core above.
 const $ = id => document.getElementById(id), cpu = TDC32.state;
-let timer = null, bitmapRendered = false, loadedSource = null, programFilename = 'tdc32-program.asm';
+let timer = null, fastRunning = false, fastChannel = null, fastDisabled = [];
+let bitmapRendered = false, loadedSource = null, programFilename = 'tdc32-program.asm';
 function valueDisplay(value) {
   const n = Number(value) >>> 0;
   return `<span class="hover-value" tabindex="0"><span class="value-main">${TDC32.fmt(n)}</span><span class="value-pop"><b>Hex:</b> ${TDC32.fmt(n)}<br><b>Dec:</b> ${n}<br><b>Bin:</b> ${n.toString(2).padStart(32, '0')}</span></span>`;
@@ -771,7 +772,7 @@ function render() {
   $('pc').className = cpu.changedRegs.has(15) ? 'changed' : '';
   $('sp').className = cpu.changedRegs.has(14) ? 'changed' : '';
   $('cusr').className = cpu.changedRegs.has(13) ? 'changed' : '';
-  $('runstate').textContent = cpu.trap ? 'ROM / TRAP STOP' : cpu.halted ? 'Halted' : timer ? 'Running' : 'Ready';
+  $('runstate').textContent = cpu.trap ? 'ROM / TRAP STOP' : cpu.halted ? 'Halted' : timer || fastRunning ? 'Running' : 'Ready';
   flagUI();
   $('registers').innerHTML = Array.from({ length: 13 }, (_, i) =>
     `<div class="reg ${cpu.changedRegs.has(i) ? 'changed' : ''}"><span>R${i}</span>${valueDisplay(cpu.regs[i])}</div>`
@@ -820,13 +821,57 @@ function renderMemory() {
   }
   $('memory').innerHTML = html;
 }
-function trace(ins) {
-  const div = document.createElement('div');
-  div.innerHTML = `<span class="pc">${TDC32.fmt(ins.pc)}</span> &nbsp;${ins.line}`;
-  $('trace').prepend(div);
+function traceBatch(instructions) {
+  const recent = instructions.slice(-160), fragment = document.createDocumentFragment();
+  for (let i = recent.length - 1; i >= 0; i--) {
+    const ins = recent[i], div = document.createElement('div');
+    div.innerHTML = `<span class="pc">${TDC32.fmt(ins.pc)}</span> &nbsp;${ins.line}`;
+    fragment.appendChild(div);
+  }
+  $('trace').prepend(fragment);
   while ($('trace').children.length > 160) $('trace').lastChild.remove();
 }
-function stop() { if (timer) { clearInterval(timer); timer = null; } render(); }
+function trace(ins) { traceBatch([ins]); }
+function setFastUI(disabled) {
+  if (disabled) {
+    fastDisabled = Array.from(document.querySelectorAll('button, textarea, input, select'))
+      .filter(el => el.id !== 'stop').map(el => [el, el.disabled]);
+    fastDisabled.forEach(([el]) => { el.disabled = true; });
+  } else {
+    fastDisabled.forEach(([el, wasDisabled]) => { el.disabled = wasDisabled; });
+    fastDisabled = [];
+  }
+}
+function stop() {
+  if (timer) { clearInterval(timer); timer = null; }
+  if (fastRunning) {
+    fastRunning = false;
+    if (fastChannel) { fastChannel.port1.close(); fastChannel.port2.close(); fastChannel = null; }
+    setFastUI(false);
+  }
+  render();
+}
+function runFastChunk() {
+  if (!fastRunning) return;
+  const batch = []; let memoryChanged = false;
+  for (let i = 0; i < 512 && !cpu.halted && !cpu.trap; i++) {
+    const ins = TDC32.step();
+    if (ins) batch.push(ins);
+    if (cpu.changedMem.size) memoryChanged = true;
+    if (!ins) break;
+  }
+  if (memoryChanged) bitmapRendered = false;
+  traceBatch(batch); render();
+  if (cpu.halted || cpu.trap) { stop(); return; }
+  if (fastRunning && fastChannel) fastChannel.port2.postMessage(0);
+}
+function startFastRun() {
+  fastRunning = true; setFastUI(true);
+  fastChannel = new MessageChannel();
+  fastChannel.port1.onmessage = runFastChunk;
+  fastChannel.port2.postMessage(0);
+  render();
+}
 function execute() {
   const ins = TDC32.step(); if (ins) trace(ins); render();
   if (cpu.halted || cpu.trap) stop();
@@ -871,7 +916,10 @@ $('step').onclick = () => {
 $('run').onclick = () => {
   if (!cpu.program.length || loadedSource !== $('source').value) $('reset').click();
   if (loadedSource !== $('source').value || cpu.halted) return;
-  stop(); timer = setInterval(execute, Number($('runDelay').value) || 5); render();
+  stop();
+  const interval = Number($('runDelay').value);
+  if (interval === 0) startFastRun();
+  else { timer = setInterval(execute, interval || 5); render(); }
 };
 $('stop').onclick = stop;
 $('memrefresh').onclick = renderMemory;
