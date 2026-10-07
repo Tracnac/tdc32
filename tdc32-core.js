@@ -2,8 +2,9 @@
 'use strict';
 
 const TDC32 = (() => {
-  // POC installs 32 KiB of RAM at 0x0000; ROM vectors begin at 0x8000 per spec.
-  const RAM_BYTES = 0x8000;
+  // POC installs 32 KiB of RAM at 0x0000; ROM vectors begin at 0x8000.
+  // The debugger adds a 640x480, packed 1bpp video-memory device at 0x00010000.
+  const RAM_BYTES = 0x8000, SCREEN_BASE = 0x00010000, SCREEN_BYTES = 640 * 480 / 8;
   const FLAG = { Z: 1, N: 2, C: 4, V: 8, I: 0x20, S: 0x4000, T: 0x8000 };
   const SR_MASK = FLAG.Z | FLAG.N | FLAG.C | FLAG.V | FLAG.I;
   const conds = {
@@ -14,6 +15,7 @@ const TDC32 = (() => {
   const state = {
     regs: new Uint32Array(16), pc: 0, cycles: 0,
     ram: new DataView(new ArrayBuffer(RAM_BYTES)),
+    framebuffer: new DataView(new ArrayBuffer(SCREEN_BYTES)),
     program: [], sourceMap: new Map(), dataImage: [],
     halted: false, trap: null, changedRegs: new Set(), changedMem: new Set(),
     last: null
@@ -50,7 +52,17 @@ const TDC32 = (() => {
   }
 
   function splitArgs(s) { return s.split(',').map(x => x.trim()).filter(Boolean); }
-  function cleanLine(s) { return s.replace(/;.*/, '').trim(); }
+  function cleanLine(s) {
+    let quoted = false, escaped = false;
+    for (let i = 0; i < s.length; i++) {
+      const ch = s[i];
+      if (escaped) { escaped = false; continue; }
+      if (quoted && ch === '\\') { escaped = true; continue; }
+      if (ch === '"') quoted = !quoted;
+      else if (ch === ';' && !quoted) return s.slice(0, i).trim();
+    }
+    return s.trim();
+  }
   function literal32(s, lineNo) {
     const n = parseNum(s);
     if (n === null || !Number.isInteger(n) || n < -0x80000000 || n > 0xffffffff)
@@ -58,43 +70,126 @@ const TDC32 = (() => {
     return u32(n);
   }
 
-  // Expand LI before assigning addresses so labels account for its emitted words.
+  // Assemble code and initialized data into their declared addresses.
   function assemble(source) {
-    const labels = new Map(), raw = [], dataImage = [];
-    let pc = 0;
+    const labels = new Map(), raw = [], dataImage = [], occupiedBytes = new Set();
+    let pc = 0, entryPC = null;
+    const mappedByte = address => (address >= 0 && address < RAM_BYTES) ||
+      (address >= SCREEN_BASE && address < SCREEN_BASE + SCREEN_BYTES);
+    const reserve = (address, width, lineNo) => {
+      if (!Number.isInteger(address) || address < 0 || address + width - 1 > 0xffffffff)
+        fail(`Line ${lineNo}: invalid data address`);
+      for (let i = 0; i < width; i++) {
+        const at = address + i;
+        if (!mappedByte(at)) fail(`Line ${lineNo}: data address ${fmt(at)} is not mapped`);
+        if (occupiedBytes.has(at)) fail(`Line ${lineNo}: address ${fmt(at)} is already occupied`);
+      }
+      for (let i = 0; i < width; i++) occupiedBytes.add(address + i);
+    };
+    const defineLabel = (name, address, lineNo) => {
+      if (!/^[\w.$]+$/.test(name)) fail(`Line ${lineNo}: invalid label “${name}”`);
+      const key = name.toLowerCase();
+      if (labels.has(key)) fail(`Line ${lineNo}: duplicate label ${name}`);
+      labels.set(key, address);
+    };
+    const parseAddress = (text, lineNo, aligned = false) => {
+      const address = parseNum(text);
+      if (!Number.isInteger(address) || address < 0 || address > 0xffffffff || (aligned && (address & 3)))
+        fail(`Line ${lineNo}: expected a ${aligned ? 'word-aligned ' : ''}32-bit address`);
+      return address;
+    };
+    const dataArgs = text => text.split(/[\s,]+/).map(x => x.trim()).filter(Boolean);
+
     for (const [i, original] of source.split(/\r?\n/).entries()) {
-      let line = cleanLine(original);
+      const lineNo = i + 1, line = cleanLine(original);
       if (!line) continue;
       const lm = /^:([\w.$]+)$/.exec(line);
-      if (lm) {
-        const name = lm[1].toLowerCase();
-        if (labels.has(name)) fail(`Line ${i + 1}: duplicate label ${lm[1]}`);
-        labels.set(name, pc);
+      if (lm) { defineLabel(lm[1], pc, lineNo); continue; }
+      const firstSpace = line.search(/\s/), mn = firstSpace < 0 ? line : line.slice(0, firstSpace);
+      const op = mn.toLowerCase(), rest = firstSpace < 0 ? '' : line.slice(firstSpace).trimStart();
+      const args = splitArgs(rest), words = dataArgs(rest);
+
+      if (op === '.adr') {
+        if (words.length !== 1) fail(`Line ${lineNo}: .adr syntax is .adr address`);
+        pc = parseAddress(words[0], lineNo, true); continue;
+      }
+      if (op === '.code') {
+        if (words.length !== 1) fail(`Line ${lineNo}: .code syntax is .code label`);
+        if (pc + 4 > RAM_BYTES || (pc & 3)) fail(`Line ${lineNo}: code label must be word-aligned in installed RAM`);
+        defineLabel(words[0], pc, lineNo); continue;
+      }
+      if (op === '.data') {
+        if (words.length !== 1) fail(`Line ${lineNo}: .data syntax is .data name`);
+        defineLabel(words[0], pc, lineNo); continue;
+      }
+      if (op === '.str') {
+        const encoded = /^"(?:[^"\\]|\\.)*"$/.test(rest.trim());
+        if (!encoded) fail(`Line ${lineNo}: .str syntax is .str "US-ASCII text"`);
+        let text;
+        try { text = JSON.parse(rest.trim()); } catch { fail(`Line ${lineNo}: invalid .str quoting or escape`); }
+        for (let i = 0; i < text.length; i++) {
+          const value = text.charCodeAt(i);
+          if (value > 0x7f) fail(`Line ${lineNo}: .str accepts US-ASCII characters only`);
+          reserve(pc, 1, lineNo); dataImage.push({ address: pc, valueText: String(value), width: 1, lineNo }); pc++;
+        }
         continue;
       }
-      const [mn, ...tail] = line.split(/\s+/), op = mn.toLowerCase(), args = splitArgs(tail.join(' '));
-      if (op === 'li') {
-        if (args.length !== 2) fail(`Line ${i + 1}: LI syntax is LI Rd, imm32`);
+      if (['.u8','.u16','.u32'].includes(op)) {
+        if (!words.length) fail(`Line ${lineNo}: ${op} requires at least one unsigned value`);
+        const width = op === '.u8' ? 1 : op === '.u16' ? 2 : 4;
+        for (const valueText of words) {
+          reserve(pc, width, lineNo);
+          dataImage.push({ address: pc, valueText, width, lineNo });
+          pc += width;
+        }
+        continue;
+      }
+      if (op === 'lea') {
+        if (args.length !== 2) fail(`Line ${lineNo}: LEA syntax is LEA Rd, label`);
         const rd = register(args[0]);
-        if (rd === null || rd > 13) fail(`Line ${i + 1}: LI destination must be R0–R13`);
-        const value = literal32(args[1], i + 1), hi = value >>> 16, lo = value & 0xffff;
-        const emitted = value <= 0xffff
-          ? [`ld ${args[0]}, ${value}`]
-          : [`ld ${args[0]}, ${hi}`, `ld.l ${args[0]}, ${lo}`];
-        for (const expanded of emitted) { raw.push({ line: expanded, displayLine: line, lineNo: i + 1, pc }); pc += 4; }
-      } else if (op === '.word') {
-        if (args.length !== 1) fail(`Line ${i + 1}: .word takes one literal`);
-        const value = literal32(args[0], i + 1);
-        dataImage.push({ address: pc, value, lineNo: i + 1 });
-        raw.push({ data: true, line, lineNo: i + 1, pc }); pc += 4;
+        if (rd === null || rd > 13) fail(`Line ${lineNo}: LEA destination must be R0–R13`);
+        if (parseNum(args[1]) !== null) fail(`Line ${lineNo}: LEA requires a label, not an immediate`);
+        const expanded = `add ${args[0]}, pc, ${args[1]}`;
+        if (pc & 3 || pc + 4 > RAM_BYTES) fail(`Line ${lineNo}: code must be assembled at an aligned address in installed RAM`);
+        reserve(pc, 4, lineNo); raw.push({ line: expanded, displayLine: expanded, leaTarget: args[1], lineNo, pc });
+        if (entryPC === null) entryPC = pc;
+        pc += 4;
+      } else if (op === 'li') {
+        if (args.length !== 2) fail(`Line ${lineNo}: LI syntax is LI Rd, imm32`);
+        const rd = register(args[0]);
+        if (rd === null || rd > 13) fail(`Line ${lineNo}: LI destination must be R0–R13`);
+        const value = literal32(args[1], lineNo), hi = value >>> 16, lo = value & 0xffff;
+        const emitted = value <= 0xffff ? [`ld ${args[0]}, ${value}`] : [`ld ${args[0]}, ${hi}`, `ld.l ${args[0]}, ${lo}`];
+        for (const expanded of emitted) {
+          if (pc & 3 || pc + 4 > RAM_BYTES) fail(`Line ${lineNo}: code must be assembled at an aligned address in installed RAM`);
+          reserve(pc, 4, lineNo); raw.push({ line: expanded, displayLine: expanded, lineNo, pc });
+          if (entryPC === null) entryPC = pc;
+          pc += 4;
+        }
       } else {
-        raw.push({ line, displayLine: line, lineNo: i + 1, pc }); pc += 4;
+        if (pc & 3 || pc + 4 > RAM_BYTES) fail(`Line ${lineNo}: code must be assembled at an aligned address in installed RAM`);
+        reserve(pc, 4, lineNo); raw.push({ line, displayLine: line, lineNo, pc });
+        if (entryPC === null) entryPC = pc;
+        pc += 4;
       }
     }
-    if (pc > RAM_BYTES) fail(`Program exceeds the POC's ${RAM_BYTES / 1024} KiB installed RAM`);
-    const code = raw.filter(item => !item.data).map(item => parseInstruction(item, labels));
+
+    for (const item of raw) {
+      if (item.leaTarget && !labels.has(pcLabel(item.leaTarget)))
+        fail(`Line ${item.lineNo}: unknown LEA label “${item.leaTarget}”`);
+    }
+    for (const data of dataImage) {
+      let value = parseNum(data.valueText);
+      if (value === null && labels.has(pcLabel(data.valueText))) value = labels.get(pcLabel(data.valueText));
+      const limits = data.width === 1 ? 0xff : data.width === 2 ? 0xffff : 0xffffffff;
+      if (!Number.isInteger(value) || value < 0 || value > limits)
+        fail(`Line ${data.lineNo}: ${data.valueText} does not fit in .${data.width === 1 ? 'u8' : data.width === 2 ? 'u16' : 'u32'}`);
+      data.value = u32(value);
+    }
+    const code = raw.map(item => parseInstruction(item, labels));
     code.labels = labels;
     code.data = dataImage;
+    code.startPC = entryPC === null ? 0 : entryPC;
     return code;
   }
 
@@ -319,13 +414,31 @@ const TDC32 = (() => {
   function checkAddress(address) {
     address = u32(address);
     if (address & 3) fail(`Alignment fault at ${fmt(address)}`, 6);
-    if (address + 4 > RAM_BYTES) fail(`Illegal data memory access at ${fmt(address)}`, 5);
+    const ramWord = address + 4 <= RAM_BYTES;
+    const screenWord = address >= SCREEN_BASE && address + 4 <= SCREEN_BASE + SCREEN_BYTES;
+    if (!ramWord && !screenWord) fail(`Illegal data memory access at ${fmt(address)}`, 5);
     return address;
   }
-  function loadWord(address) { return state.ram.getUint32(checkAddress(address), false); }
-  function storeWord(address, value) {
-    address = checkAddress(address); state.ram.setUint32(address, u32(value), false); state.changedMem.add(address);
+  function loadWord(address) {
+    address = checkAddress(address);
+    return address < RAM_BYTES ? state.ram.getUint32(address, false) : state.framebuffer.getUint32(address - SCREEN_BASE, false);
   }
+  function storeWord(address, value) {
+    address = checkAddress(address);
+    if (address < RAM_BYTES) state.ram.setUint32(address, u32(value), false);
+    else state.framebuffer.setUint32(address - SCREEN_BASE, u32(value), false);
+    state.changedMem.add(address);
+  }
+  function storeData(address, value, width) {
+    for (let i = 0; i < width; i++) {
+      const at = address + i;
+      if ((at >= 0 && at < RAM_BYTES)) state.ram.setUint8(at, (value >>> ((width - i - 1) * 8)) & 0xff);
+      else if (at >= SCREEN_BASE && at < SCREEN_BASE + SCREEN_BYTES) state.framebuffer.setUint8(at - SCREEN_BASE, (value >>> ((width - i - 1) * 8)) & 0xff);
+      else fail(`Illegal data initializer at ${fmt(at)}`, 5);
+      state.changedMem.add(at);
+    }
+  }
+  function peekWord(address) { return loadWord(address); }
   function checkStackPointer(value) {
     value = u32(value);
     if ((value & 3) || value > RAM_BYTES) fail(`Stack fault: invalid SP ${fmt(value)}`, 1);
@@ -473,14 +586,15 @@ const TDC32 = (() => {
     }
   }
   function reset(instructions) {
-    state.regs.fill(0); state.pc = 0; state.cycles = 0;
+    state.regs.fill(0); state.pc = instructions.startPC ?? 0; state.cycles = 0;
     state.ram = new DataView(new ArrayBuffer(RAM_BYTES));
+    state.framebuffer = new DataView(new ArrayBuffer(SCREEN_BYTES));
     state.program = instructions; state.sourceMap = new Map(instructions.map(i => [i.pc, i]));
     state.dataImage = instructions.data || [];
     state.halted = false; state.trap = null; state.changedRegs.clear(); state.changedMem.clear(); state.last = null;
     state.regs[13] = FLAG.S; // POC reset shim enters user program in supervisor mode.
-    state.regs[14] = RAM_BYTES; state.regs[15] = 0;
-    state.dataImage.forEach(({ address, value }) => storeWord(address, value));
+    state.regs[14] = RAM_BYTES; state.regs[15] = state.pc;
+    state.dataImage.forEach(({ address, value, width }) => storeData(address, value, width));
     state.changedRegs.clear(); state.changedMem.clear();
   }
 
@@ -564,12 +678,12 @@ const TDC32 = (() => {
     }
   }
 
-  return { state, assemble, reset, step, fmt, parseNum, constants: { RAM_BYTES, FLAG } };
+  return { state, assemble, reset, step, fmt, parseNum, peekWord, constants: { RAM_BYTES, SCREEN_BASE, SCREEN_BYTES, FLAG } };
 })();
 
 // Browser UI, intentionally separate from the CPU core above.
 const $ = id => document.getElementById(id), cpu = TDC32.state;
-let timer = null, bitmapBaseCache = null, loadedSource = null;
+let timer = null, bitmapRendered = false, loadedSource = null, programFilename = 'tdc32-program.asm';
 function valueDisplay(value) {
   const n = Number(value) >>> 0;
   return `<span class="hover-value" tabindex="0"><span class="value-main">${TDC32.fmt(n)}</span><span class="value-pop"><b>Hex:</b> ${TDC32.fmt(n)}<br><b>Dec:</b> ${n}<br><b>Bin:</b> ${n.toString(2).padStart(32, '0')}</span></span>`;
@@ -598,43 +712,38 @@ function render() {
   renderBitmap();
 }
 function renderBitmap(force = false) {
-  const width = 640, height = 480, frameBytes = width * height / 8;
-  let base = TDC32.parseNum($('bitmapBase').value.trim());
-  if (base === null || base < 0 || base >= TDC32.constants.RAM_BYTES) base = 0;
-  base = Math.floor(base) >>> 0;
-  $('bitmapBase').value = TDC32.fmt(base);
-  if (!force && bitmapBaseCache === base && cpu.changedMem.size === 0) return;
-  bitmapBaseCache = base;
+  const width = 640, height = 480;
+  if (!force && bitmapRendered && cpu.changedMem.size === 0) return;
   const canvas = $('bitmap'), ctx = canvas.getContext && canvas.getContext('2d');
   if (!ctx) return;
   const image = ctx.createImageData(width, height), pixels = image.data;
   let byte = 0;
   for (let p = 0; p < width * height; p++) {
     const bit = p & 7;
-    if (bit === 0) {
-      const address = base + (p >>> 3);
-      byte = address < TDC32.constants.RAM_BYTES ? cpu.ram.getUint8(address) : 0;
-    }
+    if (bit === 0) byte = cpu.framebuffer.getUint8(p >>> 3);
     const on = (byte & (1 << (7 - bit))) !== 0, i = p * 4;
     pixels[i] = pixels[i + 1] = pixels[i + 2] = on ? 255 : 0;
     pixels[i + 3] = 255;
   }
   ctx.putImageData(image, 0, 0);
-  const available = Math.max(0, Math.min(frameBytes, TDC32.constants.RAM_BYTES - base));
-  $('bitmapInfo').textContent = `Packed monochrome, 1 bit/pixel, MSB first · ${available}/${frameBytes} bytes in installed RAM; unavailable pixels are black.`;
+  bitmapRendered = true;
+  $('bitmapInfo').textContent = `Packed monochrome, 1 bit/pixel, MSB first · base ${TDC32.fmt(TDC32.constants.SCREEN_BASE)}, ${TDC32.constants.SCREEN_BYTES} bytes.`;
 }
 function renderMemory() {
   let base = TDC32.parseNum($('memaddr').value.trim());
   if (base === null) base = 0;
   base = (base >>> 0) & ~3;
-  if (base >= TDC32.constants.RAM_BYTES) base = 0;
-  $('memaddr').value = '0x' + base.toString(16).toUpperCase();
+  const windowBytes = 64;
+  const inRam = base >= 0 && base + windowBytes <= TDC32.constants.RAM_BYTES;
+  const inScreen = base >= TDC32.constants.SCREEN_BASE && base + windowBytes <= TDC32.constants.SCREEN_BASE + TDC32.constants.SCREEN_BYTES;
+  if (!inRam && !inScreen) base = 0;
+  $('memaddr').value = TDC32.fmt(base);
   let html = '<div class="memrow head"><span>Address</span><span>+0</span><span>+4</span><span>+8</span><span>+C</span></div>';
   for (let row = 0; row < 4; row++) {
     const at = base + row * 16;
     html += `<div class="memrow"><span>${TDC32.fmt(at)}</span>`;
     for (let col = 0; col < 4; col++) {
-      const addr = at + col * 4, val = cpu.ram.getUint32(addr, false);
+      const addr = at + col * 4, val = TDC32.peekWord(addr);
       html += `<span class="${cpu.changedMem.has(addr) ? 'changed' : ''}">${TDC32.fmt(val)}</span>`;
     }
     html += '</div>';
@@ -656,11 +765,33 @@ $('reset').onclick = () => {
   stop();
   try {
     const code = TDC32.assemble($('source').value);
-    TDC32.reset(code); loadedSource = $('source').value; bitmapBaseCache = null; $('trace').innerHTML = '';
+    TDC32.reset(code); loadedSource = $('source').value; bitmapRendered = false; $('trace').innerHTML = '';
     $('message').className = 'message';
-    $('message').textContent = `Loaded ${code.length} instruction${code.length === 1 ? '' : 's'}; POC starts at RAM address 0.`;
+    $('message').textContent = `Loaded ${code.length} instruction${code.length === 1 ? '' : 's'}; entry PC ${TDC32.fmt(code.startPC)}.`;
     render();
   } catch (e) { $('message').className = 'message error'; $('message').textContent = e.message; }
+};
+$('loadFile').onclick = () => $('programFile').click();
+$('programFile').addEventListener('change', async event => {
+  const file = event.target.files && event.target.files[0];
+  if (!file) return;
+  try {
+    $('source').value = await file.text();
+    programFilename = file.name || 'tdc32-program.asm';
+    loadedSource = null; $('trace').innerHTML = '';
+    $('message').className = 'message';
+    $('message').textContent = `Loaded ${programFilename}; Step or Run to assemble and execute.`;
+  } catch (e) {
+    $('message').className = 'message error'; $('message').textContent = `Could not load file: ${e.message}`;
+  }
+  event.target.value = '';
+});
+$('saveFile').onclick = () => {
+  const blob = new Blob([$('source').value], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob), link = document.createElement('a');
+  link.href = url; link.download = programFilename; document.body.appendChild(link); link.click(); link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  $('message').className = 'message'; $('message').textContent = `Saved ${programFilename}.`;
 };
 $('step').onclick = () => {
   if (!cpu.program.length || loadedSource !== $('source').value) $('reset').click();
@@ -675,6 +806,4 @@ $('run').onclick = () => {
 $('stop').onclick = stop;
 $('memrefresh').onclick = renderMemory;
 $('memaddr').addEventListener('keydown', e => { if (e.key === 'Enter') renderMemory(); });
-$('bitmapRefresh').onclick = () => renderBitmap(true);
-$('bitmapBase').addEventListener('keydown', e => { if (e.key === 'Enter') renderBitmap(true); });
 render();
