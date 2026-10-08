@@ -1,5 +1,5 @@
 ; Four-frame 1bpp wireframe cube demo.
-; Screen MMIO: $00010000-$000195FF; 64x32 pixels centered at x=320,y=240.
+; Screen MMIO: 0x00010000-0x000195FF; 64x32 pixels centered at x=320,y=240.
 ; Load this file, then Run at 5 ms/step. Four angles cover the cube's 90-degree symmetry.
 .adr $00001000
 .code start

@@ -29,14 +29,26 @@ const TDC32 = (() => {
   const pcLabel = s => s.trim().replace(/^:/, '').toLowerCase();
   function fail(message, vector = 3) { const e = new Error(message); e.vector = vector; throw e; }
 
-  function parseNum(text) {
+  function parseNum(text, allowLegacyPrefixes = false) {
     const s = String(text).replaceAll('_', '');
     if (/^[+-]?\d+$/.test(s)) return Number(s);
-    if (/^\$[\da-f]+$/i.test(s)) return Number('0x' + s.slice(1));
-    if (/^0x[\da-f]+$/i.test(s)) return Number(s);
-    if (/^%[01]+$/.test(s)) return Number('0b' + s.slice(1));
-    if (/^0b[01]+$/i.test(s)) return Number(s);
+    if (/^0x[\da-f]+$/i.test(s) || /^0b[01]+$/i.test(s) || /^0o[0-7]+$/i.test(s)) return Number(s);
+    if (allowLegacyPrefixes && /^\$[\da-f]+$/i.test(s)) return Number('0x' + s.slice(1));
+    if (allowLegacyPrefixes && /^%[01]+$/.test(s)) return Number('0b' + s.slice(1));
     return null;
+  }
+
+  function parseDataValue(text, address, labels, lineNo) {
+    const literal = parseNum(text, true);
+    if (literal !== null) return literal;
+    const difference = /^\(\s*\$\s*-\s*(:?[\w.$]+)\s*\)$/.exec(text);
+    if (difference) {
+      const name = difference[1], key = pcLabel(name);
+      if (!labels.has(key)) fail(`Line ${lineNo}: unknown data label “${name}”`);
+      return address - labels.get(key);
+    }
+    const key = pcLabel(text);
+    return labels.has(key) ? labels.get(key) : null;
   }
 
   function register(text) {
@@ -93,12 +105,23 @@ const TDC32 = (() => {
       labels.set(key, address);
     };
     const parseAddress = (text, lineNo, aligned = false) => {
-      const address = parseNum(text);
+      const address = parseNum(text, true);
       if (!Number.isInteger(address) || address < 0 || address > 0xffffffff || (aligned && (address & 3)))
         fail(`Line ${lineNo}: expected a ${aligned ? 'word-aligned ' : ''}32-bit address`);
       return address;
     };
-    const dataArgs = text => text.split(/[\s,]+/).map(x => x.trim()).filter(Boolean);
+    const dataArgs = text => {
+      const result = []; let token = '', depth = 0;
+      const push = () => { if (token.trim()) result.push(token.trim()); token = ''; };
+      for (const ch of text) {
+        if (ch === '(') depth++;
+        else if (ch === ')') depth--;
+        if ((ch === ',' || /\s/.test(ch)) && depth === 0) push();
+        else token += ch;
+      }
+      push();
+      return result;
+    }
 
     for (const [i, original] of source.split(/\r?\n/).entries()) {
       const lineNo = i + 1, line = cleanLine(original);
@@ -115,7 +138,7 @@ const TDC32 = (() => {
       }
       if (op === '.align') {
         if (words.length !== 1) fail(`Line ${lineNo}: .align syntax is .align byte-alignment`);
-        const alignment = parseNum(words[0]);
+        const alignment = parseNum(words[0], true);
         if (!Number.isInteger(alignment) || alignment <= 0 || alignment > 0xffffffff)
           fail(`Line ${lineNo}: .align requires a positive 32-bit byte-alignment`);
         pc = Math.ceil(pc / alignment) * alignment;
@@ -258,14 +281,14 @@ const TDC32 = (() => {
         fail(`Line ${item.lineNo}: unknown LEA label “${item.leaTarget}”`);
     }
     for (const data of dataImage) {
-      let value = parseNum(data.valueText);
-      if (value === null && labels.has(pcLabel(data.valueText))) value = labels.get(pcLabel(data.valueText));
+      let value = parseDataValue(data.valueText, data.address, labels, data.lineNo);
       const limits = data.width === 1 ? 0xff : data.width === 2 ? 0xffff : 0xffffffff;
       if (!Number.isInteger(value) || value < 0 || value > limits)
         fail(`Line ${data.lineNo}: ${data.valueText} does not fit in .${data.width === 1 ? 'u8' : data.width === 2 ? 'u16' : 'u32'}`);
       data.value = u32(value);
     }
     const code = raw.map(item => parseInstruction(item, labels));
+    for (const ins of code) ins.encoding = encodeInstruction(ins);
     code.labels = labels;
     code.data = dataImage;
     code.startPC = entryPC === null ? 0 : entryPC;
@@ -433,6 +456,7 @@ const TDC32 = (() => {
     const key = pcLabel(args[1]);
     if (labels.has(key)) {
       ins.op = 'add';
+      ins.line = `add ${args[0]}, pc, ${args[1]}`;
       return parseInteger(ins, [args[0], 'pc', args[1]], labels);
     }
     fail(`Line ${ins.lineNo}: invalid LD operand “${args[1]}”`);
@@ -475,6 +499,63 @@ const TDC32 = (() => {
     const zeroExtended = ['and','or','xor','rol','ror','shl','shr','asr'].includes(ins.op) || (ins.op === 'div' && ins.modifier);
     checked16(ins.imm, ins.lineNo, zeroExtended ? 'unsigned' : 'signed');
   }
+  function encodeInstruction(ins) {
+    const opcodes = { bpr: 0, b: 1, ld: 2, st: 3, add: 4, sub: 5, mul: 6, div: 7,
+      and: 8, or: 9, xor: 10, rol: 11, ror: 12, shl: 13, shr: 14, swi: 15,
+      fbpr: 16, ftoi: 17, itof: 18, divq: 19, fadd: 20, fsub: 21, fmul: 22,
+      fdiv: 23, fabs: 24, adc: 25, sbc: 26, mulh: 27, asr: 29 };
+    let opcode = opcodes[ins.op], mode = 0, rd = 0, rs = 0, low16 = 0;
+    const immediate = n => n & 0xffff;
+    if (ins.kind === 'branch-imm' || ins.kind === 'branch-reg' || ins.kind === 'rts' || ins.kind === 'rti') {
+      opcode = opcodes.b;
+      if (ins.kind === 'rts' || ins.kind === 'rti') {
+        mode = 2; rd = ins.kind === 'rti' ? 14 : 15; rs = 14;
+      } else {
+        rd = ins.cond;
+        if (ins.kind === 'branch-reg') { mode = 1; rs = ins.rs; }
+        else low16 = immediate(ins.wordOffset);
+      }
+    } else if (ins.kind === 'bpr-imm' || ins.kind === 'bpr-reg') {
+      rd = ins.rd;
+      if (ins.kind === 'bpr-reg') { mode = 1; rs = ins.rs; }
+      else low16 = immediate(ins.imm);
+    } else if (ins.kind === 'swi') {
+      low16 = immediate(ins.value);
+    } else if (ins.kind === 'ldi' || ins.kind === 'ld-long') {
+      opcode = opcodes.ld; rd = ins.rd; low16 = immediate(ins.imm);
+    } else if (ins.kind === 'move' || ins.kind === 'set-sp') {
+      opcode = opcodes.ld; mode = 1; rd = ins.rd; rs = ins.rs;
+    } else if (ins.kind === 'load' || ins.kind === 'pop') {
+      opcode = opcodes.ld; mode = 2; rd = ins.rd;
+      rs = ins.kind === 'pop' ? 14 : ins.base;
+      low16 = ins.kind === 'pop' ? 0 : immediate(ins.offset);
+    } else if (ins.kind === 'store' || ins.kind === 'push') {
+      opcode = opcodes.st; mode = 2;
+      rd = ins.kind === 'push' ? 14 : ins.base;
+      rs = ins.src;
+      low16 = ins.kind === 'push' ? 0 : immediate(ins.offset);
+    } else if (ins.kind === 'alu-ri' || ins.kind === 'alu-rimm') {
+      rd = ins.rd; rs = ins.rs; low16 = immediate(ins.imm);
+    } else if (ins.kind === 'alu-rr') {
+      mode = 1; rd = ins.rd; rs = ins.rt;
+    } else if (ins.kind === 'alu-rrr') {
+      mode = 3; rd = ins.rd; rs = ins.rs; low16 = (ins.rt & 15) << 12;
+    } else if (ins.kind === 'fbpr') {
+      opcode = opcodes.fbpr; mode = 1; rd = ins.rd; rs = ins.rt;
+    } else if (ins.kind === 'float') {
+      opcode = opcodes[ins.op]; rd = ins.rd;
+      if (ins.args.length === 3) { mode = 3; rs = ins.rs; low16 = (ins.rt & 15) << 12; }
+      else { mode = 1; rs = ['fadd', 'fsub', 'fmul', 'fdiv'].includes(ins.op) ? ins.rt : ins.rs; }
+    } else {
+      fail(`Line ${ins.lineNo}: cannot encode instruction kind “${ins.kind}”`);
+    }
+    if (opcode === undefined) fail(`Line ${ins.lineNo}: no opcode assigned to “${ins.op}”`);
+    const modifier = ins.modifier ? 1 : 0;
+    const word = (((opcode & 31) << 27) | (modifier << 26) | ((mode & 3) << 24) |
+      ((rd & 15) << 20) | ((rs & 15) << 16) | (low16 & 0xffff)) >>> 0;
+    return { word, opcode, modifier, mode, rd, rs, low16: low16 & 0xffff };
+  }
+
   function parseFloatInstruction(ins, args) {
     const op = ins.op;
     ins.kind = 'float';
@@ -867,8 +948,10 @@ function renderMemory() {
 function traceBatch(instructions) {
   const recent = instructions.slice(-160), fragment = document.createDocumentFragment();
   for (let i = recent.length - 1; i >= 0; i--) {
-    const ins = recent[i], div = document.createElement('div');
-    div.innerHTML = `<span class="pc">${TDC32.fmt(ins.pc)}</span> &nbsp;${ins.line}`;
+    const ins = recent[i], div = document.createElement('div'), enc = ins.encoding;
+    const lowBits = enc.low16.toString(2).padStart(16, '0').replace(/(.{4})(?=.)/g, '$1_');
+    const line = ins.line.replace(/[&<>]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[ch]);
+    div.innerHTML = `<span class="pc">${TDC32.fmt(ins.pc)}</span> &nbsp;${line}<span class="encoding"> &nbsp;<span class="word">${TDC32.fmt(enc.word)}</span> opcode:${enc.opcode.toString(2).padStart(5, '0')} M:${enc.modifier} MODE:${enc.mode.toString(2).padStart(2, '0')} RD:${enc.rd.toString(2).padStart(4, '0')} RS:${enc.rs.toString(2).padStart(4, '0')} [15:0]:${lowBits}</span>`;
     fragment.appendChild(div);
   }
   $('trace').prepend(fragment);
