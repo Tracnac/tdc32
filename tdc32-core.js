@@ -113,6 +113,15 @@ const TDC32 = (() => {
         if (words.length !== 1) fail(`Line ${lineNo}: .adr syntax is .adr address`);
         pc = parseAddress(words[0], lineNo, true); continue;
       }
+      if (op === '.align') {
+        if (words.length !== 1) fail(`Line ${lineNo}: .align syntax is .align byte-alignment`);
+        const alignment = parseNum(words[0]);
+        if (!Number.isInteger(alignment) || alignment <= 0 || alignment > 0xffffffff)
+          fail(`Line ${lineNo}: .align requires a positive 32-bit byte-alignment`);
+        pc = Math.ceil(pc / alignment) * alignment;
+        if (!Number.isSafeInteger(pc) || pc > 0xffffffff) fail(`Line ${lineNo}: .align address overflows`);
+        continue;
+      }
       if (op === '.code') {
         if (words.length !== 1) fail(`Line ${lineNo}: .code syntax is .code label`);
         if (pc + 4 > RAM_BYTES || (pc & 3)) fail(`Line ${lineNo}: code label must be word-aligned in installed RAM`);
@@ -276,12 +285,32 @@ const TDC32 = (() => {
     if (!valid) fail(`Line ${lineNo}: immediate is outside the ${mode} 16-bit range`);
     return n;
   }
+  function pcRelativeLabel(label, address, pc, lineNo, form) {
+    const offset = address - pc;
+    if (offset < -0x8000 || offset > 0x7fff)
+      fail(`Line ${lineNo}: ${form} label ${label} is outside the signed 16-bit PC-relative range`);
+    return offset;
+  }
   function parseMemory(text, labels, pc, lineNo) {
     const m = /^(.*?)\((r\d+|cusr|sr|sp|pc|f(?:9|1[0-2]))\)$/i.exec(text.trim());
     if (!m) return null;
     const base = register(m[2]);
     let offset = 0;
-    if (m[1].trim()) offset = resolveImmediate(m[1], labels, pc, lineNo);
+    if (m[1].trim()) {
+      const expression = m[1].trim(), literal = parseNum(expression);
+      if (literal !== null) offset = literal;
+      else {
+        const key = pcLabel(expression);
+        if (!labels.has(key)) fail(`Line ${lineNo}: unknown memory label “${expression}”`);
+        const address = labels.get(key);
+        if (base === 15) offset = pcRelativeLabel(expression, address, pc, lineNo, 'Indexed');
+        else {
+          if (address > 0x7fff)
+            fail(`Line ${lineNo}: label ${expression} at ${fmt(address)} cannot be used as a non-PC displacement; signed offsets reach only 0x0000–0x7FFF`);
+          offset = address;
+        }
+      }
+    }
     return { base, offset: checked16(offset, lineNo) };
   }
 
@@ -386,12 +415,26 @@ const TDC32 = (() => {
     }
     const mem = parseMemory(args[1], labels, ins.pc, ins.lineNo);
     if (mem) { ins.kind = 'load'; ins.base = mem.base; ins.offset = mem.offset; return ins; }
+    const indirectLabel = /^\(([^()]+)\)$/.exec(args[1]);
+    if (indirectLabel) {
+      const name = indirectLabel[1].trim(), key = pcLabel(name);
+      if (register(name) === null && labels.has(key)) {
+        const address = labels.get(key);
+        if (address & 3) fail(`Line ${ins.lineNo}: label ${name} at ${fmt(address)} is not word-aligned for LD`);
+        ins.kind = 'load'; ins.base = 15;
+        ins.offset = pcRelativeLabel(name, address, ins.pc, ins.lineNo, 'LD');
+        return ins;
+      }
+    }
     const r = register(args[1]);
     if (r !== null) { ins.kind = 'move'; ins.rs = r; return ins; }
     const n = parseNum(args[1]);
     if (n !== null) { ins.kind = 'ldi'; ins.imm = checked16(n, ins.lineNo, 'unsigned'); return ins; }
     const key = pcLabel(args[1]);
-    if (labels.has(key)) { ins.kind = 'load'; ins.base = 15; ins.offset = checked16(labels.get(key) - ins.pc, ins.lineNo); return ins; }
+    if (labels.has(key)) {
+      ins.op = 'add';
+      return parseInteger(ins, [args[0], 'pc', args[1]], labels);
+    }
     fail(`Line ${ins.lineNo}: invalid LD operand “${args[1]}”`);
   }
   function parseStore(ins, args, labels) {
@@ -401,7 +444,7 @@ const TDC32 = (() => {
     const push = /^-\(sp\)$/i.test(args[0]);
     if (push) { ins.kind = 'push'; ins.modifier = true; return ins; }
     const mem = parseMemory(args[0], labels, ins.pc, ins.lineNo);
-    if (!mem) fail(`Line ${ins.lineNo}: ST needs (base) or offset(base); label(base) is not supported`);
+    if (!mem) fail(`Line ${ins.lineNo}: ST needs (base) or offset(base)`);
     ins.kind = 'store'; ins.base = mem.base; ins.offset = mem.offset; return ins;
   }
   function parseInteger(ins, args, labels) {
