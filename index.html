@@ -12,16 +12,16 @@
 <header><h1>TDC32.01 - architectural emulator</h1><small>Minimal CPU POC · 16 registers · 32-bit words · POC counts one cycle per instruction</small></header>
 <main>
 <section class="panel">
-<h2 class="program-heading">Program<span class="syntax-help"><button type="button" aria-label="Show syntax help" title="Syntax help">?</button><span class="syntax-help-popup" role="tooltip"><p>One instruction per line. Labels use <code>:name</code>; comments start with <code>;</code>. Instruction numbers use decimal, <code>0x</code> hex, <code>0b</code> binary, or <code>0o</code> octal; <code>$</code>/<code>%</code> prefixes are retained only in directives.</p><p>Instructions include integer and floating-point operations, branches, BPR, JSR/RTS/RTI, SWI, and SP stack forms. Pseudo-ops include LEA, ABS, MIN, MAX, NEG, NOT, INC, DEC, and the bit operations; bit aliases clobber R12.</p><p>Set addresses with <code>.adr address</code>; declare code/data labels with <code>.code name</code> and <code>.data name</code>. Initialize data with <code>.str "ASCII"</code>, <code>.u8</code>, <code>.u16</code>, and <code>.u32</code>.</p><p>Choose <code>Max speed</code> in CPU State to batch execution with UI controls disabled except Stop. The POC framebuffer is at <code>0x00010000</code>; ROM services are unavailable.</p></span></span></h2>
+<h2 class="program-heading">Program<span class="syntax-help"><button type="button" aria-label="Show syntax help" title="Syntax help">?</button><span class="syntax-help-popup" role="tooltip"><p>One instruction per line. Labels use <code>:name</code>; comments start with <code>;</code>. Numbers are decimal, <code>$</code> hexadecimal, or <code>%</code> binary; prefixes work in instructions and directives.</p><p>Instructions include integer and floating-point operations, conditional branches, BSR/RTS/RTI, SWI, PUSH, and POP. Pseudo-ops are INC and DEC.</p><p>Set addresses with <code>.adr address</code>; declare code/data labels with <code>.code name</code> and <code>.data name</code>. Initialize data with <code>.str "ASCII"</code>, <code>.u8</code>, <code>.u16</code>, and <code>.u32</code>.</p><p>Choose <code>Max speed</code> in CPU State to batch execution with UI controls disabled except Stop. The POC framebuffer is at <code>$00010000</code>; ROM services are unavailable.</p></span></span></h2>
 <textarea id="source" class="source" spellcheck="false">:start
-    ld r1, 0x5
-    ld r2, 0b1100
+    ld r1, 5
+    ld r2, %1100
     add r1, r2
-    bpr r1, 12
+    cmp r1, 12
     beq done
     ld r1, (neg_one)
 :done
-    swi -1
+    swi 63
 .data neg_one
 .u32 $FFFFFFFF</textarea>
 <div class="buttons"><button id="reset" class="primary">Reset / Assemble</button><button id="loadFile">Load File</button><button id="saveFile">Save File</button><input id="programFile" type="file" accept=".asm,.tdc,.txt,text/plain" hidden><button id="step">Step</button><button id="run">Run</button><button id="stop">Stop</button></div>
@@ -33,7 +33,7 @@
 <div class="statusrow"><div class="pill">Cycles <b id="cycles">0</b></div><div class="pill">PC <b id="pc">00000000</b></div><div class="pill">SP <b id="sp">00000000</b></div><div class="pill">CUSR <b id="cusr">00000000</b></div><div class="pill">State <b id="runstate">Ready</b></div><div class="pill run-setting"><label for="runDelay">Run interval</label><select id="runDelay" class="run-delay"><option value="0">Max speed</option><option value="5">5 ms</option><option value="20">20 ms</option><option value="150">150 ms</option></select></div></div>
 <div class="flags" id="flags"></div><h2>General-purpose registers (R0–R12)</h2><div class="regs" id="registers"></div>
 <h2 style="margin-top:14px">Current instruction</h2><div id="current" class="current">-</div>
-</div><section class="bitmap-panel"><h2>Bitmap view (640 × 480)</h2><div class="bitmap-canvas-wrap"><canvas id="bitmap" width="640" height="480" aria-label="640 by 480 one-bit memory bitmap"></canvas></div><div class="bitmap-controls"><span>Screen buffer: <b id="bitmapAddress">0x00010000–0x000195FF</b></span></div><div class="bitmap-info" id="bitmapInfo">Packed monochrome, 1 bit per pixel, MSB first. POC memory-mapped video region.</div></section></div>
+</div><section class="bitmap-panel"><h2>Bitmap view (640 × 480)</h2><div class="bitmap-canvas-wrap"><canvas id="bitmap" width="640" height="480" aria-label="640 by 480 one-bit memory bitmap"></canvas></div><div class="bitmap-controls"><span>Screen buffer: <b id="bitmapAddress">$00010000–$000195FF</b></span></div><div class="bitmap-info" id="bitmapInfo">Packed monochrome, 1 bit per pixel, MSB first. POC memory-mapped video region.</div></section></div>
 </section>
 <section class="panel">
 <h2>Memory (RAM + video memory, big-endian)</h2><div class="meta">Showing 16 words from address <input id="memaddr" value="0" size="10" aria-label="Memory address" style="background:#101820;color:inherit;border:1px solid #304052;padding:3px"> <button id="memrefresh">Go</button></div><div id="memory" class="memory"></div>
