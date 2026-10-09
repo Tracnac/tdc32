@@ -5,19 +5,19 @@
 .code start
 :main
 lea r1, frame0
-li r2, 0x00014624
+ld r2, (cube_base)
 ld r3, 32
 jsr copy_rows
 lea r1, frame1
-li r2, 0x00014624
+ld r2, (cube_base)
 ld r3, 32
 jsr copy_rows
 lea r1, frame2
-li r2, 0x00014624
+ld r2, (cube_base)
 ld r3, 32
 jsr copy_rows
 lea r1, frame3
-li r2, 0x00014624
+ld r2, (cube_base)
 ld r3, 32
 jsr copy_rows
 ba main
@@ -36,6 +36,8 @@ bne copy_loop
 rts
 
 .adr $00004000
+.data cube_base
+.u32 0x00014624
 .data frame0
 .u32 0x00000000, 0x00000000
 .u32 0x00000000, 0x00000000
