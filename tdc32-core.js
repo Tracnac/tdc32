@@ -75,13 +75,6 @@ const TDC32 = (() => {
     }
     return s.trim();
   }
-  function literal32(s, lineNo) {
-    const n = parseNum(s);
-    if (n === null || !Number.isInteger(n) || n < -0x80000000 || n > 0xffffffff)
-      fail(`Line ${lineNo}: expected a 32-bit literal for LI`);
-    return u32(n);
-  }
-
   // Assemble code and initialized data into their declared addresses.
   function assemble(source) {
     const labels = new Map(), raw = [], dataImage = [], occupiedBytes = new Set();
@@ -257,17 +250,15 @@ const TDC32 = (() => {
         if (entryPC === null) entryPC = pc;
         pc += 4;
       } else if (op === 'li') {
-        if (args.length !== 2) fail(`Line ${lineNo}: LI syntax is LI Rd, imm32`);
+        if (args.length !== 2) fail(`Line ${lineNo}: LI syntax is LI Rd, label`);
         const rd = register(args[0]);
         if (rd === null || rd > 13) fail(`Line ${lineNo}: LI destination must be R0–R13`);
-        const value = literal32(args[1], lineNo), hi = value >>> 16, lo = value & 0xffff;
-        const emitted = value <= 0xffff ? [`ld ${args[0]}, ${value}`] : [`ld ${args[0]}, ${hi}`, `ld.l ${args[0]}, ${lo}`];
-        for (const expanded of emitted) {
-          if (pc & 3 || pc + 4 > RAM_BYTES) fail(`Line ${lineNo}: code must be assembled at an aligned address in installed RAM`);
-          reserve(pc, 4, lineNo); raw.push({ line: expanded, displayLine: expanded, lineNo, pc });
-          if (entryPC === null) entryPC = pc;
-          pc += 4;
-        }
+        if (parseNum(args[1], true) !== null) fail(`Line ${lineNo}: LI source must be a label`);
+        const expanded = `ld ${args[0]}, (${args[1]})`;
+        if (pc & 3 || pc + 4 > RAM_BYTES) fail(`Line ${lineNo}: code must be assembled at an aligned address in installed RAM`);
+        reserve(pc, 4, lineNo); raw.push({ line: expanded, displayLine: expanded, lineNo, pc });
+        if (entryPC === null) entryPC = pc;
+        pc += 4;
       } else {
         if (pc & 3 || pc + 4 > RAM_BYTES) fail(`Line ${lineNo}: code must be assembled at an aligned address in installed RAM`);
         reserve(pc, 4, lineNo); raw.push({ line, displayLine: line, lineNo, pc });
