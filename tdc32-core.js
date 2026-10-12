@@ -2,8 +2,14 @@
 'use strict';
 
 const TDC32 = (() => {
+  const SYSTEM_PAGE_BYTES = 0x400, RAM_START = SYSTEM_PAGE_BYTES;
   const RAM_BYTES = 0x8000, ROM_BASE = 0x8000, ROM_BYTES = 0x8000;
   const SCREEN_BASE = 0x00010000, SCREEN_BYTES = 640 * 480 / 8;
+  const SYS = Object.freeze({ SSP: 0x0100, USP: 0x0104, BOOT_ENTRY: 0x0108, RAM_START: 0x010c, RAM_END: 0x0110 });
+  const IO = Object.freeze({ KEY_STATE: 0x0200, CYCLE_COUNT: 0x0204, FRAME_COUNT: 0x0208, IRQ_PENDING: 0x0210, IRQ_MASK: 0x0214, IRQ_ACK: 0x0218, VBL_STATUS: 0x0220, BOARD_ID: 0x0224 });
+  const IRQ = Object.freeze({ VBL: 1, KEYBOARD: 2 });
+  const KEY = Object.freeze({ LEFT: 1, RIGHT: 2, FIRE: 4, START: 8, PAUSE: 16 });
+  const CYCLES_PER_FRAME = 16667;
   const FLAG = { Z: 0x0001, N: 0x0002, C: 0x0004, V: 0x0008, I: 0x2000, S: 0x4000, T: 0x8000 };
   const SR_MASK = FLAG.Z | FLAG.N | FLAG.C | FLAG.V;
   const CUSR_MASK = FLAG.T | FLAG.S | FLAG.I | SR_MASK;
@@ -32,9 +38,13 @@ const TDC32 = (() => {
   const state = {
     regs: new Uint32Array(16), pc: 0, cycles: 0,
     ram: new DataView(new ArrayBuffer(RAM_BYTES)),
+    systemPage: new DataView(new ArrayBuffer(SYSTEM_PAGE_BYTES)),
+    rom: new DataView(new ArrayBuffer(ROM_BYTES)),
     framebuffer: new DataView(new ArrayBuffer(SCREEN_BYTES)),
+    userSP: RAM_BYTES, supervisorSP: 0x4000,
+    keyboard: 0, irqPending: 0, irqMask: IRQ.VBL, frameCount: 0, framePhase: 0, vblank: false,
     program: [], sourceMap: new Map(), dataImage: [],
-    halted: false, trap: null, changedRegs: new Set(), changedMem: new Set(), last: null
+    halted: false, trap: null, lastException: null, changedRegs: new Set(), changedMem: new Set(), last: null
   };
   const u32 = n => Number(n) >>> 0;
   const sx = n => n | 0;
@@ -105,8 +115,8 @@ const TDC32 = (() => {
 
   function assemble(source) {
     const labels = new Map(), raw = [], dataImage = [], occupied = new Set();
-    let pc = 0, entryPC = null;
-    const mappedByte = a => (a >= 0 && a < RAM_BYTES) || (a >= SCREEN_BASE && a < SCREEN_BASE + SCREEN_BYTES);
+    let pc = RAM_START, entryPC = null;
+    const mappedByte = a => (a >= RAM_START && a < RAM_BYTES) || (a >= SCREEN_BASE && a < SCREEN_BASE + SCREEN_BYTES);
     function reserve(address, width, lineNo) {
       if (!Number.isInteger(address) || address < 0 || address + width - 1 > 0xffffffff)
         fail(`Line ${lineNo}: invalid address`);
@@ -130,7 +140,7 @@ const TDC32 = (() => {
     }
     function addInstruction(line, lineNo) {
       for (const expanded of expandPseudo(line)) {
-        if ((pc & 3) || pc + 4 > RAM_BYTES) fail(`Line ${lineNo}: instruction must be word-aligned in installed RAM`);
+        if (pc < RAM_START || (pc & 3) || pc + 4 > RAM_BYTES) fail(`Line ${lineNo}: instruction must be word-aligned in installed RAM`);
         reserve(pc, 4, lineNo);
         raw.push({ line: expanded, displayLine: expanded, lineNo, pc });
         if (entryPC === null) entryPC = pc;
@@ -160,7 +170,7 @@ const TDC32 = (() => {
       }
       if (op === '.code' || op === '.data') {
         if (words.length !== 1) fail(`Line ${lineNo}: ${op} syntax is ${op} label`);
-        if (op === '.code' && ((pc & 3) || pc + 4 > RAM_BYTES)) fail(`Line ${lineNo}: code label must be word-aligned in installed RAM`);
+        if (op === '.code' && (pc < RAM_START || (pc & 3) || pc + 4 > RAM_BYTES)) fail(`Line ${lineNo}: code label must be word-aligned in installed RAM`);
         defineLabel(words[0], pc, lineNo); continue;
       }
       if (op === '.str') {
@@ -200,7 +210,7 @@ const TDC32 = (() => {
       ins.encoding = encodeInstruction(ins);
       if (ins.encoding.word === 0) fail(`Line ${ins.lineNo}: the all-zero instruction word is reserved`);
     }
-    code.labels = labels; code.data = dataImage; code.startPC = entryPC === null ? 0 : entryPC;
+    code.labels = labels; code.data = dataImage; code.startPC = entryPC === null ? RAM_START : entryPC;
     return code;
   }
   function parseImm(text, labels, pc, lineNo, mode = 'signed', allowLabel = false) {
@@ -454,12 +464,21 @@ const TDC32 = (() => {
     if (r === 15) return state.pc >>> 0;
     return state.regs[r] >>> 0;
   }
+  function applyCusr(value) {
+    const old = state.regs[13] & CUSR_MASK, next = value & CUSR_MASK;
+    if (!!(old & FLAG.S) !== !!(next & FLAG.S)) {
+      if (old & FLAG.S) state.supervisorSP = state.regs[14] >>> 0;
+      else state.userSP = state.regs[14] >>> 0;
+      state.regs[14] = (next & FLAG.S) ? state.supervisorSP : state.userSP;
+      state.changedRegs.add(14);
+    }
+    state.regs[13] = next >>> 0;
+    if (old !== next) state.changedRegs.add(13);
+  }
   function writeCusr(value) {
     const old = state.regs[13] & CUSR_MASK;
     const control = supervisor() ? (value & (FLAG.T | FLAG.S | FLAG.I)) : (old & (FLAG.T | FLAG.S | FLAG.I));
-    const next = control | (value & SR_MASK);
-    state.regs[13] = next >>> 0;
-    if (old !== next) state.changedRegs.add(13);
+    applyCusr(control | (value & SR_MASK));
   }
   function writeDataReg(r, value) {
     value = u32(value);
@@ -511,43 +530,134 @@ const TDC32 = (() => {
   function checkMemory(address, width, alignment) {
     address = u32(address);
     if (address % alignment) fail(`Alignment fault at ${fmt(address)}`, 6);
-    const inRam = address < RAM_BYTES && address + width <= RAM_BYTES;
+    const inSystem = address < SYSTEM_PAGE_BYTES && address + width <= SYSTEM_PAGE_BYTES;
+    const inRam = address >= RAM_START && address < RAM_BYTES && address + width <= RAM_BYTES;
     const inScreen = address >= SCREEN_BASE && address + width <= SCREEN_BASE + SCREEN_BYTES;
-    if (!inRam && !inScreen) fail(`Illegal data memory access at ${fmt(address)}`, 5);
+    if (!inSystem && !inRam && !inScreen) fail(`Illegal data memory access at ${fmt(address)}`, 5);
+    if (inSystem && address >= SYS.SSP && address < SYS.RAM_END + 4 && width !== 4)
+      fail('System control registers require aligned 32-bit accesses', 6);
+    if (inSystem && address >= 0x200 && width !== 4)
+      fail('I/O board registers require aligned 32-bit accesses', 6);
     return address;
+  }
+  function readIO(address) {
+    switch (address) {
+      case IO.KEY_STATE: return state.keyboard >>> 0;
+      case IO.CYCLE_COUNT: return state.cycles >>> 0;
+      case IO.FRAME_COUNT: return state.frameCount >>> 0;
+      case IO.IRQ_PENDING: return state.irqPending >>> 0;
+      case IO.IRQ_MASK: return state.irqMask >>> 0;
+      case IO.IRQ_ACK: return 0;
+      case IO.VBL_STATUS: return state.vblank ? 1 : 0;
+      case IO.BOARD_ID: return 0x54444332;
+      default: fail(`Unassigned I/O register ${fmt(address)}`, 5);
+    }
+  }
+  function writeIO(address, value) {
+    value = u32(value);
+    if (address === IO.IRQ_MASK) {
+      if (!supervisor()) fail('IRQ mask is supervisor-only', 3);
+      state.irqMask = value & (IRQ.VBL | IRQ.KEYBOARD);
+      return;
+    }
+    if (address === IO.IRQ_ACK) {
+      if (!supervisor()) fail('IRQ acknowledge is supervisor-only', 3);
+      state.irqPending &= ~value;
+      state.vblank = !!(state.irqPending & IRQ.VBL);
+      return;
+    }
+    fail(`Write to read-only or unassigned I/O register ${fmt(address)}`, 5);
   }
   function loadMemory(address, width) {
     address = checkMemory(address, width, width === 4 ? 4 : width === 2 ? 2 : 1);
-    const view = address < RAM_BYTES ? state.ram : state.framebuffer;
-    const offset = address < RAM_BYTES ? address : address - SCREEN_BASE;
-    if (width === 1) return view.getUint8(offset);
-    if (width === 2) return view.getUint16(offset, false);
-    return view.getUint32(offset, false);
+    if (address < 0x100) {
+      if (width !== 4) fail('Vector table requires 32-bit accesses', 6);
+      return state.systemPage.getUint32(address, false);
+    }
+    if (address < 0x200) {
+      if (width === 4 && (address === SYS.SSP || address === SYS.USP)) {
+        if (!supervisor()) fail('Stack bank registers are supervisor-only', 3);
+        return (address === SYS.SSP ? (supervisor() ? state.regs[14] : state.supervisorSP) : (supervisor() ? state.userSP : state.regs[14])) >>> 0;
+      }
+      const offset = address;
+      if (width === 1) return state.systemPage.getUint8(offset);
+      if (width === 2) return state.systemPage.getUint16(offset, false);
+      return state.systemPage.getUint32(offset, false);
+    }
+    if (address < 0x300) {
+      if (width !== 4) fail('I/O board registers require 32-bit accesses', 6);
+      return readIO(address);
+    }
+    if (address < SYSTEM_PAGE_BYTES) fail(`Unassigned system-page address ${fmt(address)}`, 5);
+    if (address < RAM_BYTES) {
+      if (width === 1) return state.ram.getUint8(address);
+      if (width === 2) return state.ram.getUint16(address, false);
+      return state.ram.getUint32(address, false);
+    }
+    const offset = address - SCREEN_BASE;
+    if (width === 1) return state.framebuffer.getUint8(offset);
+    if (width === 2) return state.framebuffer.getUint16(offset, false);
+    return state.framebuffer.getUint32(offset, false);
   }
   function storeMemory(address, value, width) {
     address = checkMemory(address, width, width === 4 ? 4 : width === 2 ? 2 : 1);
-    const view = address < RAM_BYTES ? state.ram : state.framebuffer;
-    const offset = address < RAM_BYTES ? address : address - SCREEN_BASE;
-    if (width === 1) view.setUint8(offset, value & 0xff);
-    else if (width === 2) view.setUint16(offset, value & 0xffff, false);
-    else view.setUint32(offset, u32(value), false);
+    if (address < 0x100) {
+      if (width !== 4) fail('Vector table requires 32-bit accesses', 6);
+      if (!supervisor() || address === 0) fail('Vector table write is privileged or protected', 3);
+      state.systemPage.setUint32(address, u32(value), false);
+    } else if (address < 0x200) {
+      if (address === SYS.SSP || address === SYS.USP) {
+        if (width !== 4 || !supervisor()) fail('Stack bank registers require supervisor word access', 3);
+        const supervisorBank = address === SYS.SSP, sp = checkStackPointerFor(value, supervisorBank);
+        if (supervisorBank) {
+          state.supervisorSP = sp;
+          if (supervisor()) { state.regs[14] = sp; state.changedRegs.add(14); }
+        } else state.userSP = sp;
+      } else if (address === SYS.BOOT_ENTRY || address === SYS.RAM_START || address === SYS.RAM_END) {
+        fail('Boot information registers are read-only', 5);
+      } else if (width === 1) state.systemPage.setUint8(address, value & 0xff);
+      else if (width === 2) state.systemPage.setUint16(address, value & 0xffff, false);
+      else state.systemPage.setUint32(address, u32(value), false);
+    } else if (address < 0x300) {
+      if (width !== 4) fail('I/O board registers require 32-bit accesses', 6);
+      writeIO(address, value);
+    } else if (address < SYSTEM_PAGE_BYTES) fail(`Unassigned system-page address ${fmt(address)}`, 5);
+    else if (address < RAM_BYTES) {
+      if (width === 1) state.ram.setUint8(address, value & 0xff);
+      else if (width === 2) state.ram.setUint16(address, value & 0xffff, false);
+      else state.ram.setUint32(address, u32(value), false);
+    } else {
+      const offset = address - SCREEN_BASE;
+      if (width === 1) state.framebuffer.setUint8(offset, value & 0xff);
+      else if (width === 2) state.framebuffer.setUint16(offset, value & 0xffff, false);
+      else state.framebuffer.setUint32(offset, u32(value), false);
+    }
     for (let i = 0; i < width; i++) state.changedMem.add(address + i);
+  }
+  function stackBoundsFor(supervisorBank) { return supervisorBank ? { low: RAM_START, high: 0x4000 } : { low: 0x4000, high: RAM_BYTES }; }
+  function stackBounds() { return stackBoundsFor(supervisor()); }
+  function checkStackPointerFor(value, supervisorBank) {
+    value = u32(value);
+    const { low, high } = stackBoundsFor(supervisorBank);
+    if ((value & 3) || value < low || value > high) fail(`Stack fault: invalid SP ${fmt(value)}`, 1);
+    return value;
   }
   function checkStackPointer(value) {
     value = u32(value);
-    if ((value & 3) || value > RAM_BYTES) fail(`Stack fault: invalid SP ${fmt(value)}`, 1);
+    const { low, high } = stackBounds();
+    if ((value & 3) || value < low || value > high) fail(`Stack fault: invalid SP ${fmt(value)}`, 1);
     return value;
   }
   function pushWord(value) {
-    const sp = checkStackPointer(state.regs[14]);
-    if (sp < 4) fail('Stack fault: stack underflow', 1);
+    const sp = checkStackPointer(state.regs[14]), { low } = stackBounds();
+    if (sp < low + 4) fail('Stack fault: stack underflow', 1);
     const next = sp - 4;
     state.ram.setUint32(next, u32(value), false);
     state.changedMem.add(next); state.regs[14] = next; state.changedRegs.add(14);
   }
   function stackPeek(address) {
-    const sp = checkStackPointer(address);
-    if (sp + 4 > RAM_BYTES) fail('Stack fault: stack underflow', 1);
+    const sp = checkStackPointer(address), { high } = stackBounds();
+    if (sp + 4 > high) fail('Stack fault: stack underflow', 1);
     return state.ram.getUint32(sp, false);
   }
   function condition(cond) {
@@ -870,7 +980,7 @@ const TDC32 = (() => {
         state.halted = true; state.pc = u32(nextPC); state.regs[15] = state.pc; state.changedRegs.add(15);
         return nextPC;
       }
-      if (imm >= 1 && imm <= 8) { enterException(imm, `SWI service ${imm} ROM handler unavailable`, nextPC); return state.pc; }
+      if (imm >= 1 && imm <= 8) { enterException(imm, `SWI service ${imm}`, nextPC); return state.pc; }
       fail('Reserved SWI number', 3);
     }
     if (ins.kind === 'branch') {
@@ -889,7 +999,7 @@ const TDC32 = (() => {
     if (ins.kind === 'pop') {
       if ((rd === 14 || rd === 15) && !supervisor()) fail('POP SP/PC outside supervisor mode', 3);
       const oldSP = checkStackPointer(state.regs[14]), value = stackPeek(oldSP), incremented = oldSP + 4;
-      if (incremented > RAM_BYTES) fail('Stack fault: stack underflow', 1);
+      if (incremented > stackBounds().high) fail('Stack fault: stack underflow', 1);
       if (rd === 14) {
         const loadedSP = checkStackPointer(value);
         state.regs[14] = loadedSP; state.changedRegs.add(14);
@@ -904,7 +1014,7 @@ const TDC32 = (() => {
     }
     if (ins.kind === 'rts') {
       const oldSP = checkStackPointer(state.regs[14]), value = stackPeek(oldSP), incremented = oldSP + 4;
-      if (incremented > RAM_BYTES) fail('Stack fault: stack underflow', 1);
+      if (incremented > stackBounds().high) fail('Stack fault: stack underflow', 1);
       if (value & 3) fail(`Misaligned return address ${fmt(value)}`, 6);
       state.regs[14] = incremented; state.changedRegs.add(14); return value;
     }
@@ -912,10 +1022,10 @@ const TDC32 = (() => {
       if (!supervisor()) fail('RTI outside supervisor mode', 3);
       const oldSP = checkStackPointer(state.regs[14]);
       const savedCusr = stackPeek(oldSP), savedPC = stackPeek(oldSP + 4), newSP = oldSP + 8;
-      if (newSP > RAM_BYTES) fail('Stack fault: stack underflow', 1);
+      if (newSP > stackBounds().high) fail('Stack fault: stack underflow', 1);
       if (savedPC & 3) fail(`Misaligned RTI address ${fmt(savedPC)}`, 6);
       state.regs[14] = newSP; state.changedRegs.add(14);
-      state.regs[13] = savedCusr & CUSR_MASK; state.changedRegs.add(13);
+      writeCusr(savedCusr & CUSR_MASK);
       return savedPC;
     }
     if (ins.kind === 'set-sp') {
@@ -962,39 +1072,66 @@ const TDC32 = (() => {
 
   function enterException(vector, message, savedPC) {
     try {
+      const savedCusr = state.regs[13] & CUSR_MASK;
+      applyCusr((savedCusr | FLAG.S) & ~FLAG.I);
       pushWord(savedPC);
-      pushWord(state.regs[13] & CUSR_MASK);
-      state.regs[13] = ((state.regs[13] | FLAG.S) & ~FLAG.I) & CUSR_MASK;
-      state.changedRegs.add(13);
-      state.trap = `${message} (vector ${vector}; ROM handler unavailable in this POC)`;
-      state.halted = true;
+      pushWord(savedCusr);
+      const target = state.systemPage.getUint32(vector * 4, false);
+      if (target & 3) fail(`Unaligned vector ${vector} target ${fmt(target)}`, 6);
+      state.lastException = `${message} (vector ${vector})`;
+      state.pc = target; state.regs[15] = target; state.changedRegs.add(15);
     } catch (e) {
-      state.regs[13] = (state.regs[13] | FLAG.T) & CUSR_MASK;
+      state.regs[13] = (state.regs[13] | FLAG.T | FLAG.S) & CUSR_MASK;
       state.trap = `Exception entry failed: ${e.message}`;
       state.halted = true;
       state.changedRegs.add(13);
     }
   }
+  function initializeROM(entryPC) {
+    state.rom = new DataView(new ArrayBuffer(ROM_BYTES));
+    state.systemPage = new DataView(new ArrayBuffer(SYSTEM_PAGE_BYTES));
+    for (let vector = 0; vector < 64; vector++) {
+      const target = vector === 0 ? ROM_BASE : vector === 8 ? ROM_BASE + 0x104 : ROM_BASE + 0x100;
+      state.systemPage.setUint32(vector * 4, target, false);
+    }
+    state.systemPage.setUint32(SYS.BOOT_ENTRY, entryPC >>> 0, false);
+    state.systemPage.setUint32(SYS.RAM_START, RAM_START, false);
+    state.systemPage.setUint32(SYS.RAM_END, RAM_BYTES, false);
+    state.rom.setUint32(0x0000, ((OPCODE.ld << 24) | (13 << 20) | (11 << 16)) >>> 0, false); // LD CUSR,R11
+    state.rom.setUint32(0x0004, ((15 << 20) | (12 << 16)) >>> 0, false); // BA R12
+    state.rom.setUint32(0x0100, ((OPCODE.swi << 24) | 63) >>> 0, false); // fatal exception stop
+    state.rom.setUint32(0x0104, ((OPCODE.push << 24) | (1 << 16)) >>> 0, false); // preserve R1
+    state.rom.setUint32(0x0108, ((OPCODE.ld << 24) | (1 << 20) | 0xffff) >>> 0, false);
+    state.rom.setUint32(0x010c, ((OPCODE.ldu << 24) | (1 << 20) | 0xffff) >>> 0, false);
+    state.rom.setUint32(0x0110, ((1 << 31) | (OPCODE.st << 24) | (1 << 20) | IO.IRQ_ACK) >>> 0, false);
+    state.rom.setUint32(0x0114, ((OPCODE.pop << 24) | (1 << 20)) >>> 0, false);
+    state.rom.setUint32(0x0118, OPCODE.rti << 24, false);
+  }
   function storeInitialized(address, value, width) {
     for (let i = 0; i < width; i++) {
       const at = address + i, byte = (value >>> ((width - i - 1) * 8)) & 0xff;
-      if (at >= 0 && at < RAM_BYTES) state.ram.setUint8(at, byte);
+      if (at >= RAM_START && at < RAM_BYTES) state.ram.setUint8(at, byte);
       else if (at >= SCREEN_BASE && at < SCREEN_BASE + SCREEN_BYTES) state.framebuffer.setUint8(at - SCREEN_BASE, byte);
       else fail(`Invalid initialized data address ${fmt(at)}`, 5);
       state.changedMem.add(at);
     }
   }
   function reset(instructions = []) {
-    state.regs.fill(0); state.pc = instructions.startPC ?? 0; state.cycles = 0;
+    const entryPC = instructions.startPC ?? RAM_START;
+    state.regs.fill(0); state.cycles = 0;
     state.ram = new DataView(new ArrayBuffer(RAM_BYTES));
     state.framebuffer = new DataView(new ArrayBuffer(SCREEN_BYTES));
+    state.userSP = RAM_BYTES; state.supervisorSP = 0x4000;
+    state.keyboard = 0; state.irqPending = 0; state.irqMask = IRQ.VBL; state.frameCount = 0; state.framePhase = 0; state.vblank = false;
     state.program = instructions; state.sourceMap = new Map(instructions.map(i => [i.pc, i]));
     state.dataImage = instructions.data || [];
-    state.halted = false; state.trap = null; state.changedRegs.clear(); state.changedMem.clear(); state.last = null;
-    state.regs[13] = FLAG.S; // POC reset shim: ROM boot code selects the assembled entry point.
-    state.regs[14] = RAM_BYTES; state.regs[15] = state.pc;
+    state.halted = false; state.trap = null; state.lastException = null; state.changedRegs.clear(); state.changedMem.clear(); state.last = null;
+    initializeROM(entryPC);
+    state.pc = state.systemPage.getUint32(0, false);
+    state.regs[11] = FLAG.I; state.regs[12] = entryPC >>> 0;
+    state.regs[13] = FLAG.S; state.regs[14] = state.supervisorSP; state.regs[15] = state.pc;
     for (const ins of instructions) {
-      if (ins.pc < 0 || ins.pc + 4 > RAM_BYTES || (ins.pc & 3)) fail(`Invalid instruction address ${fmt(ins.pc)}`, 5);
+      if (ins.pc < RAM_START || ins.pc + 4 > RAM_BYTES || (ins.pc & 3)) fail(`Invalid instruction address ${fmt(ins.pc)}`, 5);
       state.ram.setUint32(ins.pc, ins.encoding.word, false);
     }
     for (const d of state.dataImage) storeInitialized(d.address, d.value, d.width);
@@ -1003,16 +1140,37 @@ const TDC32 = (() => {
   function fetchWord(address) {
     address = u32(address);
     if (address & 3) fail(`Instruction alignment fault at ${fmt(address)}`, 6);
-    if (address < RAM_BYTES && address + 4 <= RAM_BYTES) return state.ram.getUint32(address, false);
-    if (address >= ROM_BASE && address + 4 <= ROM_BASE + ROM_BYTES)
-      fail(`ROM instruction fetch at ${fmt(address)} unavailable in this POC`, 5);
+    if (address >= RAM_START && address < RAM_BYTES && address + 4 <= RAM_BYTES) return state.ram.getUint32(address, false);
+    if (address >= ROM_BASE && address + 4 <= ROM_BASE + ROM_BYTES) return state.rom.getUint32(address - ROM_BASE, false);
     fail(`Instruction fetch outside installed memory at ${fmt(address)}`, 5);
+  }
+  function setKey(bit, down) {
+    const old = state.keyboard;
+    state.keyboard = down ? (old | bit) >>> 0 : (old & ~bit) >>> 0;
+    if (old !== state.keyboard) {
+      state.irqPending |= IRQ.KEYBOARD;
+      state.changedMem.add(IO.KEY_STATE);
+    }
+  }
+  function advanceClock() {
+    state.cycles = (state.cycles + 1) >>> 0;
+    state.framePhase++;
+    if (state.framePhase >= CYCLES_PER_FRAME) {
+      state.framePhase = 0;
+      state.frameCount = (state.frameCount + 1) >>> 0;
+      state.vblank = true; state.irqPending |= IRQ.VBL;
+      state.changedMem.add(IO.FRAME_COUNT); state.changedMem.add(IO.VBL_STATUS);
+    }
   }
   function step() {
     if (state.halted) return null;
+    state.changedRegs.clear(); state.changedMem.clear(); state.last = null;
+    if ((state.regs[13] & FLAG.I) && (state.irqPending & state.irqMask)) {
+      enterException(8, 'Hardware interrupt', state.pc >>> 0);
+      return null;
+    }
     const oldPC = state.pc >>> 0;
     let ins;
-    state.changedRegs.clear(); state.changedMem.clear(); state.last = null;
     const oldCusr = state.regs[13];
     try {
       const word = fetchWord(oldPC), metadata = state.sourceMap.get(oldPC);
@@ -1020,7 +1178,7 @@ const TDC32 = (() => {
       state.last = ins;
       if (oldPC > 0xfffffffb) fail('Program counter overflow', 4);
       const nextPC = oldPC + 4;
-      state.cycles++;
+      advanceClock();
       const target = execute(ins, nextPC);
       if (!state.halted && !state.trap) {
         state.pc = u32(target); state.regs[15] = state.pc; state.changedRegs.add(15);
@@ -1034,9 +1192,14 @@ const TDC32 = (() => {
       return ins || null;
     }
   }
-  function peekWord(address) { return loadMemory(address, 4); }
+  function peekWord(address) {
+    address = u32(address);
+    if ((address & 3) === 0 && address >= ROM_BASE && address + 4 <= ROM_BASE + ROM_BYTES)
+      return state.rom.getUint32(address - ROM_BASE, false);
+    return loadMemory(address, 4);
+  }
 
-  return { state, assemble, reset, step, fmt, parseNum, peekWord, constants: { RAM_BYTES, SCREEN_BASE, SCREEN_BYTES, FLAG } };
+  return { state, assemble, reset, step, fmt, parseNum, peekWord, setKey, constants: { RAM_START, RAM_BYTES, SYSTEM_PAGE_BYTES, ROM_BASE, ROM_BYTES, SCREEN_BASE, SCREEN_BYTES, SYS, IO, IRQ, KEY, FLAG, CYCLES_PER_FRAME } };
 })();
 // Browser UI, intentionally separate from the CPU core above.
 const $ = id => document.getElementById(id), cpu = TDC32.state;
@@ -1059,13 +1222,14 @@ function render() {
   $('pc').className = cpu.changedRegs.has(15) ? 'changed' : '';
   $('sp').className = cpu.changedRegs.has(14) ? 'changed' : '';
   $('cusr').className = cpu.changedRegs.has(13) ? 'changed' : '';
-  $('runstate').textContent = cpu.trap ? 'ROM / TRAP STOP' : cpu.halted ? 'Halted' : timer || fastRunning ? 'Running' : 'Ready';
+  $('runstate').textContent = cpu.trap ? 'ENTRY FAILURE' : cpu.halted ? 'Halted' : timer || fastRunning ? 'Running' : 'Ready';
+  $('lastEvent').textContent = cpu.trap || cpu.lastException || '—';
   flagUI();
   $('registers').innerHTML = Array.from({ length: 13 }, (_, i) =>
     `<div class="reg ${cpu.changedRegs.has(i) ? 'changed' : ''}"><span>R${i}</span>${valueDisplay(cpu.regs[i])}</div>`
   ).join('');
   const ins = cpu.sourceMap.get(cpu.pc);
-  $('current').textContent = cpu.trap ? cpu.trap : ins ? `${TDC32.fmt(ins.pc)}  ${ins.line}` : cpu.halted ? 'CPU halted' : 'No instruction at PC';
+  $('current').textContent = cpu.trap ? cpu.trap : ins ? `${TDC32.fmt(ins.pc)}  ${ins.line}` : cpu.pc >= TDC32.constants.ROM_BASE ? `${TDC32.fmt(cpu.pc)}  Firmware` : cpu.halted ? 'CPU halted' : 'No instruction at PC';
   renderMemory();
   renderBitmap();
 }
@@ -1092,17 +1256,20 @@ function renderMemory() {
   if (base === null) base = 0;
   base = (base >>> 0) & ~3;
   const windowBytes = 64;
-  const inRam = base >= 0 && base + windowBytes <= TDC32.constants.RAM_BYTES;
+  const inSystem = base >= 0 && base + windowBytes <= TDC32.constants.SYSTEM_PAGE_BYTES;
+  const inRam = base >= TDC32.constants.RAM_START && base + windowBytes <= TDC32.constants.RAM_BYTES;
+  const inRom = base >= TDC32.constants.ROM_BASE && base + windowBytes <= TDC32.constants.ROM_BASE + TDC32.constants.ROM_BYTES;
   const inScreen = base >= TDC32.constants.SCREEN_BASE && base + windowBytes <= TDC32.constants.SCREEN_BASE + TDC32.constants.SCREEN_BYTES;
-  if (!inRam && !inScreen) base = 0;
+  if (!inSystem && !inRam && !inRom && !inScreen) base = 0;
   $('memaddr').value = TDC32.fmt(base);
   let html = '<div class="memrow head"><span>Address</span><span>+0</span><span>+4</span><span>+8</span><span>+C</span></div>';
   for (let row = 0; row < 4; row++) {
     const at = base + row * 16;
     html += `<div class="memrow"><span>${TDC32.fmt(at)}</span>`;
     for (let col = 0; col < 4; col++) {
-      const addr = at + col * 4, val = TDC32.peekWord(addr);
-      html += `<span class="${cpu.changedMem.has(addr) ? 'changed' : ''}">${TDC32.fmt(val)}</span>`;
+      const addr = at + col * 4;
+      let value; try { value = TDC32.fmt(TDC32.peekWord(addr)); } catch { value = '—'; }
+      html += `<span class="${cpu.changedMem.has(addr) ? 'changed' : ''}">${value}</span>`;
     }
     html += '</div>';
   }
@@ -1171,7 +1338,7 @@ $('reset').onclick = () => {
     const code = TDC32.assemble($('source').value);
     TDC32.reset(code); loadedSource = $('source').value; bitmapRendered = false; $('trace').innerHTML = '';
     $('message').className = 'message';
-    $('message').textContent = `Loaded ${code.length} instruction${code.length === 1 ? '' : 's'}; entry PC ${TDC32.fmt(code.startPC)}.`;
+    $('message').textContent = `Boot ROM ready; ${code.length} instruction${code.length === 1 ? '' : 's'} loaded at ${TDC32.fmt(code.startPC)}.`;
     render();
   } catch (e) { $('message').className = 'message error'; $('message').textContent = e.message; }
 };
@@ -1213,4 +1380,22 @@ $('run').onclick = () => {
 $('stop').onclick = stop;
 $('memrefresh').onclick = renderMemory;
 $('memaddr').addEventListener('keydown', e => { if (e.key === 'Enter') renderMemory(); });
+const browserKeys = new Map([
+  ['ArrowLeft', TDC32.constants.KEY.LEFT], ['KeyA', TDC32.constants.KEY.LEFT],
+  ['ArrowRight', TDC32.constants.KEY.RIGHT], ['KeyD', TDC32.constants.KEY.RIGHT],
+  ['Space', TDC32.constants.KEY.FIRE], ['Enter', TDC32.constants.KEY.START], ['Escape', TDC32.constants.KEY.PAUSE]
+]);
+function handleBrowserKey(event, down) {
+  const bit = browserKeys.get(event.code);
+  if (!bit) return;
+  const editing = event.target && event.target.matches && event.target.matches('textarea, input, select, [contenteditable="true"]');
+  if (down && editing) return;
+  event.preventDefault(); TDC32.setKey(bit, down); render();
+}
+document.addEventListener('keydown', event => handleBrowserKey(event, true));
+document.addEventListener('keyup', event => handleBrowserKey(event, false));
+window.addEventListener('blur', () => {
+  for (const bit of Object.values(TDC32.constants.KEY)) TDC32.setKey(bit, false);
+  render();
+});
 render();

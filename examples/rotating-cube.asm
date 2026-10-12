@@ -1,26 +1,59 @@
-; Four-frame 1bpp wireframe cube demo.
-; Screen MMIO: $00010000-$000195FF; 64x32 pixels centered at x=320,y=240.
-; Load this file, then Run at 5 ms/step. Four angles cover the cube's 90-degree symmetry.
+; VBL-paced 1bpp wireframe cube. Space toggles auto-rotation;
+; Left/Right step through four angles and select rotation direction.
+; Screen buffer: $00010000-$000195FF; cube is 64x32 pixels.
+; Load this file, choose Reset / Assemble, then Run at Max speed.
 .adr $00001000
 .code start
-:main
-ld r1, frame0
+ld r8, 3
+ld r9, 1                 ; automatic rotation starts enabled
+ld r10, 0                ; previous sampled Space state
+ld r6, $0208(R0)          ; initial virtual frame count
+:frame_wait
+ld r7, $0208(R0)
+cmp r7, r6
+beq frame_wait
+ld r6, r7
+ld r5, $0200(R0)          ; keyboard held-key bitmask
+btst r5, 2                ; Space toggles auto-rotation on key-down
+bne space_down
+ld r10, 0
+ba read_direction
+:space_down
+btst r10, 0
+bne read_direction
+cmp r9, 0
+beq enable_auto
+ld r9, 0
+ba remember_space
+:enable_auto
+ld r9, 1
+:remember_space
+ld r10, 1
+:read_direction
+btst r5, 0                ; Left: rotate backward
+bne rotate_left
+btst r5, 1                ; Right: rotate forward
+bne rotate_right
+cmp r9, 0
+beq select_frame
+add r8, 1                 ; auto-rotate only when enabled
+ba select_frame
+:rotate_left
+sub r8, 1
+ba select_frame
+:rotate_right
+add r8, 1
+:select_frame
+and r8, 3                 ; four pre-rendered angles
+ld r1, frame_table
+ld r2, r8
+shl r2, 2
+add r1, r2
+ld r1, (r1)               ; resolve selected frame address
 ld r2, (cube_base)
 ld r3, 32
 bsr copy_rows
-ld r1, frame1
-ld r2, (cube_base)
-ld r3, 32
-bsr copy_rows
-ld r1, frame2
-ld r2, (cube_base)
-ld r3, 32
-bsr copy_rows
-ld r1, frame3
-ld r2, (cube_base)
-ld r3, 32
-bsr copy_rows
-ba main
+ba frame_wait
 
 :copy_rows
 :copy_loop
@@ -38,6 +71,8 @@ rts
 .adr $00004000
 .data cube_base
 .u32 $00014624
+.data frame_table
+.u32 frame0, frame1, frame2, frame3
 .data frame0
 .u32 $00000000, $00000000
 .u32 $00000000, $00000000
